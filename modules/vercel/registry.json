@@ -1,0 +1,15 @@
+{
+  "name": "vercel",
+  "description": "Vercel project + deploy module",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "vercel": "^50.0.0"
+  },
+  "secrets": ["VERCEL_TOKEN"],
+  "signupUrl": "https://vercel.com/signup",
+  "tokenUrl": "https://vercel.com/account/tokens",
+  "instructions": "Add VERCEL_TOKEN to packages/infra/environments/<env>/secrets.yaml. The vercel CLI is installed as a devDependency for deploys."
+}
