@@ -226,10 +226,23 @@ export const natsServerModule = defineModule({
       }
     }
 
-    await flyFetch(
-      `/v1/apps/${config.appName}/machines/${machineId}/wait?state=started&timeout=60`,
-      flyToken,
-    )
+    // Fly's update cycle (stop → swap config → start) auto-starts the
+    // machine, but the full cycle can take 60–90s. Don't call /start
+    // ourselves — it races the auto-start and 412s with "getting replaced".
+    // /wait caps at 60s server-side; poll up to ~4 minutes.
+    const waitURL = `/v1/apps/${config.appName}/machines/${machineId}/wait?state=started&timeout=60`
+    let started = false
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        await flyFetch(waitURL, flyToken)
+        started = true
+        break
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (!msg.includes('(408)')) throw err
+      }
+    }
+    if (!started) throw new Error(`Machine "${machineId}" did not reach started state in 4m`)
     console.log(`  Machine "${machineId}" started`)
 
     return {
