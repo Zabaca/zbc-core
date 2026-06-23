@@ -1,0 +1,15 @@
+{
+  "name": "cloudflare",
+  "description": "Cloudflare Worker deploy module (optional static assets, Durable Object, Container)",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "secrets": ["CLOUDFLARE_API_TOKEN"],
+  "signupUrl": "https://dash.cloudflare.com/sign-up",
+  "tokenUrl": "https://dash.cloudflare.com/profile/api-tokens",
+  "instructions": "Add CLOUDFLARE_API_TOKEN to packages/infra/environments/<env>/secrets.yaml; set accountId in the instance config (not a secret). The Worker topology lives in the package's own wrangler.jsonc, which is the source of truth for it. Container-backed Workers need Docker running locally at apply time and a Workers Paid plan with Containers enabled."
+}
