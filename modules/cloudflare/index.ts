@@ -8,14 +8,14 @@ import { defineModule } from '../../src/define-module'
  * cloudflare — deploys a Cloudflare Worker (optionally with static assets, a
  * Durable Object, and a Container) via `wrangler deploy`.
  *
- * This is a THIN orchestrator, the same shape as the vercel/turso/lima-engine
- * modules: `apply` runs on the operator machine, reads CF creds from
- * `ctx.secrets`, runs an optional local build, then shells `wrangler deploy` in
- * the package's own directory. The Worker TOPOLOGY (name, assets binding,
- * durable_objects, containers, migrations) lives in that package's
- * `wrangler.jsonc` — wrangler is the source of truth for it, not this module.
- * That keeps the module reusable for the eventual Astro-off-Vercel migration
- * (a plain assets Worker) as well as the container-backed payloads.
+ * This is a THIN orchestrator, the same shape as the turso module: `apply` runs
+ * on the operator machine, reads CF creds from `ctx.secrets`, runs an optional
+ * local build, then shells `wrangler deploy` in the package's own directory. The
+ * Worker TOPOLOGY (name, assets binding, durable_objects, containers,
+ * migrations) lives in that package's `wrangler.jsonc` — wrangler is the source
+ * of truth for it, not this module. That keeps the module reusable for both
+ * plain assets Workers (e.g. a static Astro/Next site) and container-backed
+ * payloads (e.g. a DO-bound NATS server).
  *
  * Auth is non-interactive: wrangler reads `CLOUDFLARE_API_TOKEN` +
  * `CLOUDFLARE_ACCOUNT_ID` from the environment, so no `wrangler login` is
@@ -27,6 +27,21 @@ import { defineModule } from '../../src/define-module'
  * with Docker, so Docker must be running locally at apply time, and the account
  * must be on a Workers Paid plan with Containers enabled. A plain assets Worker
  * (Phase A) has neither requirement.
+ *
+ * Two config knobs shape WHICH worker a given apply targets:
+ *   - `wranglerEnv` selects a named `env.<name>` block in the package's
+ *     wrangler.jsonc (`--env`), so one package can ship distinct workers per zbc
+ *     environment from a single config file.
+ *   - `workerName` renames the deployed worker (`--name`), which is what powers
+ *     per-PR preview workers (`zbc-<app>-pr-<N>`). The `*.workers.dev` deploy-URL
+ *     regex still matches a renamed worker's URL.
+ *
+ * KNOWN GAP: unlike the vercel module, this module deploys OPAQUE workers — it
+ * does NOT sync imported-instance outputs into the worker's env (the vercel
+ * module's `ctx.imports` → `MAIN_DB_DATABASE_URL`-style vars). A consuming worker
+ * sources its config from its own wrangler.jsonc `vars` + `workerSecrets`. If a
+ * future consumer wires `turso → cloudflare` and wants outputs auto-injected, add
+ * an import-sync pass here then.
  */
 
 /** Resolve the wrangler binary: prefer the package-local one, else `bunx`. */
@@ -91,6 +106,23 @@ export const cloudflareModule = defineModule({
      * deploy time. No-op for asset-only Workers.
      */
     immediateContainerRollout: z.boolean().default(false),
+    /**
+     * Wrangler named environment (`--env <name>`). When set, deploy and every
+     * `secret put` target the matching `env.<name>` block in the package's
+     * wrangler.jsonc, so a non-production zbc environment (e.g. `preview`) can
+     * ship a DISTINCT worker (own name/domain/bindings) from the same package —
+     * without a separate wrangler config. Omit for the top-level (production)
+     * worker.
+     */
+    wranglerEnv: z.string().optional(),
+    /**
+     * Override the deployed worker name (`--name <workerName>`). This is what
+     * enables per-PR preview workers (e.g. `zbc-landing-pr-42`) from a single
+     * wrangler.jsonc: the preview instance sets a PR-scoped name so each PR
+     * lands on its own isolated worker + `*.workers.dev` URL. Omit to use the
+     * `name` declared in wrangler.jsonc.
+     */
+    workerName: z.string().optional(),
   }),
   outputs: z.object({
     deployUrl: z.string(),
@@ -117,10 +149,15 @@ export const cloudflareModule = defineModule({
     }
 
     // 2. Deploy. Creates/updates the Worker script (+ assets, DO, container).
+    //    --env selects the named wrangler environment (e.g. preview) so it ships
+    //    a distinct worker from the same package; --name overrides the worker
+    //    name (per-PR preview workers); both omitted = the package's default.
     const deployArgs = ['deploy']
+    if (config.wranglerEnv) deployArgs.push('--env', config.wranglerEnv)
+    if (config.workerName) deployArgs.push('--name', config.workerName)
     if (config.immediateContainerRollout) deployArgs.push('--containers-rollout', 'immediate')
     console.log(
-      `  Deploying via wrangler (in ${config.workdir})${config.immediateContainerRollout ? ' [immediate container rollout]' : ''}`,
+      `  Deploying via wrangler (in ${config.workdir})${config.wranglerEnv ? ` [env: ${config.wranglerEnv}]` : ''}${config.workerName ? ` [name: ${config.workerName}]` : ''}${config.immediateContainerRollout ? ' [immediate container rollout]' : ''}`,
     )
     const out = wrangler(workdir, deployArgs, env)
     const urlMatch = out.match(/https:\/\/[^\s"',]+\.workers\.dev[^\s"',]*/)
@@ -136,7 +173,10 @@ export const cloudflareModule = defineModule({
           `workerSecrets references "${name}" but it's missing from this environment's secrets.yaml`,
         )
       }
-      wrangler(workdir, ['secret', 'put', name], env, value)
+      const secretArgs = ['secret', 'put', name]
+      if (config.wranglerEnv) secretArgs.push('--env', config.wranglerEnv)
+      if (config.workerName) secretArgs.push('--name', config.workerName)
+      wrangler(workdir, secretArgs, env, value)
       console.log(`  Set Worker secret: ${name}`)
     }
 
@@ -152,9 +192,13 @@ export const cloudflareModule = defineModule({
     }
     const workdir = path.resolve(ctx.projectRoot, config.workdir)
     // `wrangler delete` removes the Worker (and its DO/container). Non-fatal if
-    // already gone.
+    // already gone. --env / --name target the same worker `apply` deployed
+    // (named environment and/or per-PR preview name).
     try {
-      wrangler(workdir, ['delete', '--force'], env)
+      const deleteArgs = ['delete', '--force']
+      if (config.wranglerEnv) deleteArgs.push('--env', config.wranglerEnv)
+      if (config.workerName) deleteArgs.push('--name', config.workerName)
+      wrangler(workdir, deleteArgs, env)
       console.log('  Deleted Worker')
     } catch (err) {
       console.log(`  Worker delete skipped: ${(err as Error).message}`)
