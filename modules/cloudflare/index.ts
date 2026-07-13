@@ -1,6 +1,6 @@
 import * as path from 'node:path'
 import * as fs from 'node:fs'
-import { execFileSync, execSync } from 'node:child_process'
+import { execSync, spawnSync } from 'node:child_process'
 import { z } from 'zod'
 import { defineModule } from '../../src/define-module'
 
@@ -48,29 +48,32 @@ import { defineModule } from '../../src/define-module'
 function resolveWrangler(workdir: string): { cmd: string; pre: string[] } {
   const local = path.join(workdir, 'node_modules', '.bin', 'wrangler')
   if (fs.existsSync(local)) return { cmd: local, pre: [] }
-  // Fall back to bunx; --bun keeps it on the bun runtime already in use.
-  return { cmd: 'bunx', pre: ['--bun', 'wrangler'] }
+  // Fall back to bunx on the NODE runtime. Never pass --bun: wrangler under
+  // the bun runtime exits 0 after uploading the version but silently skips the
+  // deploy/trigger step (2026-07-12 lov incident in Zabaca/ceo: three green
+  // applies, zero code deployed).
+  return { cmd: 'bunx', pre: ['wrangler'] }
 }
 
 /** Run wrangler in `workdir` with CF creds in the env; return captured stdout. */
 function wrangler(workdir: string, args: string[], env: NodeJS.ProcessEnv, input?: string): string {
   const { cmd, pre } = resolveWrangler(workdir)
-  try {
-    const out = execFileSync(cmd, [...pre, ...args], {
-      cwd: workdir,
-      env,
-      input,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      maxBuffer: 64 * 1024 * 1024,
-    })
-    return out.toString()
-  } catch (err: unknown) {
-    const stderr = (err as { stderr?: Buffer }).stderr?.toString() ?? ''
-    const stdout = (err as { stdout?: Buffer }).stdout?.toString() ?? ''
+  // spawnSync (not execFileSync) so BOTH streams are captured on success too:
+  // wrangler splits its human output across stdout/stderr, and parsing only
+  // stdout is how the 2026-07-12 silent-no-deploy went unnoticed.
+  const res = spawnSync(cmd, [...pre, ...args], {
+    cwd: workdir,
+    env,
+    input,
+    maxBuffer: 64 * 1024 * 1024,
+  })
+  const combined = `${res.stdout?.toString() ?? ''}\n${res.stderr?.toString() ?? ''}`
+  if (res.status !== 0 || res.error) {
     throw new Error(
-      `wrangler ${args.join(' ')} failed:\n${stderr || stdout || (err as Error).message}`,
+      `wrangler ${args.join(' ')} failed (exit ${res.status}):\n${combined.trim() || res.error?.message}`,
     )
   }
+  return combined
 }
 
 const buildSchema = z.object({
@@ -160,6 +163,13 @@ export const cloudflareModule = defineModule({
       `  Deploying via wrangler (in ${config.workdir})${config.wranglerEnv ? ` [env: ${config.wranglerEnv}]` : ''}${config.workerName ? ` [name: ${config.workerName}]` : ''}${config.immediateContainerRollout ? ' [immediate container rollout]' : ''}`,
     )
     const out = wrangler(workdir, deployArgs, env)
+    // Success theater guard: wrangler can exit 0 without actually deploying
+    // (the --bun incident above). Require the deploy confirmation line.
+    if (!/Deployed\s+\S+\s+triggers/.test(out)) {
+      throw new Error(
+        `wrangler deploy exited 0 but printed no "Deployed ... triggers" confirmation:\n${out}`,
+      )
+    }
     const urlMatch = out.match(/https:\/\/[^\s"',]+\.workers\.dev[^\s"',]*/)
     const deployUrl = urlMatch?.[0] ?? ''
     console.log(`  Deployed: ${deployUrl || '(URL not parsed — see wrangler output)'}`)
