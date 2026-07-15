@@ -36,12 +36,16 @@ import { defineModule } from '../../src/define-module'
  *     per-PR preview workers (`zbc-<app>-pr-<N>`). The `*.workers.dev` deploy-URL
  *     regex still matches a renamed worker's URL.
  *
- * KNOWN GAP: unlike the vercel module, this module deploys OPAQUE workers — it
- * does NOT sync imported-instance outputs into the worker's env (the vercel
- * module's `ctx.imports` → `MAIN_DB_DATABASE_URL`-style vars). A consuming worker
- * sources its config from its own wrangler.jsonc `vars` + `workerSecrets`. If a
- * future consumer wires `turso → cloudflare` and wants outputs auto-injected, add
- * an import-sync pass here then.
+ * IMPORT SYNC: like the vercel module, this module syncs imported-instance
+ * outputs into the worker after deploy. Each output of every `ctx.imports`
+ * instance is pushed as a Worker secret named `<INSTANCE>_<OUTPUT>` (upper-cased,
+ * hyphens to underscores) — the same naming convention the vercel module uses for
+ * its project env vars, so the two modules are symmetric (e.g. a `main-db` turso
+ * import's `databaseUrl`/`authToken` outputs land as `MAIN_DB_DATABASEURL` /
+ * `MAIN_DB_AUTHTOKEN`). Imported values go to Worker SECRETS, not wrangler
+ * `vars`: some imported outputs are auth tokens, and pushing all of them the same
+ * way beats splitting on visibility. A consuming worker can still source
+ * additional config from its own wrangler.jsonc `vars` + `workerSecrets`.
  */
 
 /** Resolve the wrangler binary: prefer the package-local one, else `bunx`. */
@@ -188,6 +192,27 @@ export const cloudflareModule = defineModule({
       if (config.workerName) secretArgs.push('--name', config.workerName)
       wrangler(workdir, secretArgs, env, value)
       console.log(`  Set Worker secret: ${name}`)
+    }
+
+    // 4. Sync imported-instance outputs as Worker secrets. Mirrors the vercel
+    //    module's `ctx.imports` env-var pass: each output becomes
+    //    `<INSTANCE>_<OUTPUT>` (upper-cased, hyphens → underscores), so the two
+    //    modules derive identical names from the same imports. Everything goes
+    //    to SECRETS (not wrangler vars): imported outputs include auth tokens
+    //    (e.g. turso's authToken), and pushing them all uniformly beats
+    //    splitting on visibility. Same stdin-piped `secret put` path + --env /
+    //    --name targeting as the workerSecrets loop above.
+    for (const [instanceName, outputs] of Object.entries(ctx.imports)) {
+      if (typeof outputs !== 'object' || outputs === null) continue
+      for (const [key, value] of Object.entries(outputs as Record<string, unknown>)) {
+        if (typeof value !== 'string') continue
+        const secretName = `${instanceName}_${key}`.toUpperCase().replace(/-/g, '_')
+        const secretArgs = ['secret', 'put', secretName]
+        if (config.wranglerEnv) secretArgs.push('--env', config.wranglerEnv)
+        if (config.workerName) secretArgs.push('--name', config.workerName)
+        wrangler(workdir, secretArgs, env, value)
+        console.log(`  Set Worker secret from import: ${secretName} (${instanceName}.${key})`)
+      }
     }
 
     return { deployUrl }
