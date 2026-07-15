@@ -36,16 +36,17 @@ import { defineModule } from '../../src/define-module'
  *     per-PR preview workers (`zbc-<app>-pr-<N>`). The `*.workers.dev` deploy-URL
  *     regex still matches a renamed worker's URL.
  *
- * IMPORT SYNC: like the vercel module, this module syncs imported-instance
- * outputs into the worker after deploy. Each output of every `ctx.imports`
- * instance is pushed as a Worker secret named `<INSTANCE>_<OUTPUT>` (upper-cased,
- * hyphens to underscores), the same naming convention the vercel module uses for
- * its project env vars, so the two modules are symmetric (e.g. a `main-db` turso
- * import's `databaseUrl`/`authToken` outputs land as `MAIN_DB_DATABASEURL` /
- * `MAIN_DB_AUTHTOKEN`). Imported values go to Worker SECRETS, not wrangler
- * `vars`: some imported outputs are auth tokens, and pushing all of them the same
- * way beats splitting on visibility. A consuming worker can still source
- * additional config from its own wrangler.jsonc `vars` + `workerSecrets`.
+ * IMPORT SYNC: `workerSecrets` and `workerVars` entries can be either a plain
+ * name (resolved from this environment's secrets.yaml, exactly as before) or a
+ * `{ name, from, output }` reference into an imported instance's outputs
+ * (`ctx.imports[from][output]`, populated by the engine from that instance's
+ * validated outputs). Secrets are pushed via `wrangler secret put`, piped
+ * through stdin; vars are passed as `wrangler deploy --var KEY:VALUE`. The two
+ * are deliberately separate fields — a var is visible in `wrangler.jsonc`/the
+ * dashboard, a secret is not — so an imported value's exposure is an explicit
+ * per-entry choice, never inferred. Referencing an instance not listed in this
+ * instance's `imports`, or an output key that instance doesn't emit, is a hard
+ * error naming both.
  */
 
 /** Resolve the wrangler binary: prefer the package-local one, else `bunx`. */
@@ -85,6 +86,56 @@ const buildSchema = z.object({
   cwd: z.string().optional(),
 })
 
+/**
+ * A worker secret/var entry: either a plain name (resolved from this
+ * environment's secrets.yaml) or a reference into an imported instance's
+ * outputs (`ctx.imports[from][output]`).
+ */
+const workerValueSchema = z.union([
+  z.string(),
+  z.object({
+    /** Env var name inside the Worker. */
+    name: z.string(),
+    /** Instance name — must be listed in this instance's `imports`. */
+    from: z.string(),
+    /** Which output of that instance to read. */
+    output: z.string(),
+  }),
+])
+
+type WorkerValueEntry = z.infer<typeof workerValueSchema>
+
+/** Resolve a workerSecrets/workerVars entry to its `{ name, value }` pair. */
+function resolveWorkerValue(
+  entry: WorkerValueEntry,
+  ctx: { secrets: Record<string, string>; imports: Record<string, unknown> },
+  fieldName: string,
+): { name: string; value: string } {
+  if (typeof entry === 'string') {
+    const value = ctx.secrets[entry]
+    if (!value) {
+      throw new Error(
+        `${fieldName} references "${entry}" but it's missing from this environment's secrets.yaml`,
+      )
+    }
+    return { name: entry, value }
+  }
+
+  const instanceOutputs = ctx.imports[entry.from]
+  if (instanceOutputs === undefined) {
+    throw new Error(
+      `${fieldName} entry "${entry.name}" references instance "${entry.from}", which is not in this instance's imports`,
+    )
+  }
+  const value = (instanceOutputs as Record<string, unknown> | null)?.[entry.output]
+  if (typeof value !== 'string') {
+    throw new Error(
+      `${fieldName} entry "${entry.name}" references output "${entry.output}" on instance "${entry.from}", which doesn't emit it`,
+    )
+  }
+  return { name: entry.name, value }
+}
+
 export const cloudflareModule = defineModule({
   name: 'cloudflare',
   configSchema: z.object({
@@ -98,12 +149,21 @@ export const cloudflareModule = defineModule({
     /** Optional local build run before deploy (e.g. `vite build` for assets). */
     build: buildSchema.optional(),
     /**
-     * Worker secrets to push after deploy. Each entry names a key in this
-     * environment's secrets.yaml; the same name becomes a Worker secret
-     * binding (read at runtime as `env.<NAME>`). Pushed via `wrangler secret
-     * put` with the value piped through stdin.
+     * Worker secrets to push after deploy. Each entry is either a plain name
+     * — a key in this environment's secrets.yaml, becoming a Worker secret
+     * binding of the same name (read at runtime as `env.<NAME>`) — or a
+     * `{ name, from, output }` reference into an imported instance's outputs.
+     * Pushed via `wrangler secret put` with the value piped through stdin.
      */
-    workerSecrets: z.array(z.string()).default([]),
+    workerSecrets: z.array(workerValueSchema).default([]),
+    /**
+     * Worker vars to set at deploy time (`wrangler deploy --var KEY:VALUE`).
+     * Same entry shape as `workerSecrets` — plain name (from secrets.yaml) or
+     * `{ name, from, output }` — but for non-secret, publicly-visible config.
+     * Unlike secrets, var values are passed on the command line, so never
+     * route sensitive values through this field.
+     */
+    workerVars: z.array(workerValueSchema).default([]),
     /**
      * For container-backed Workers: roll the running container to the new image
      * IMMEDIATELY on deploy (`--containers-rollout immediate`). The wrangler
@@ -155,7 +215,21 @@ export const cloudflareModule = defineModule({
       execSync(config.build.command, { cwd: buildCwd, stdio: 'inherit', env })
     }
 
-    // 2. Deploy. Creates/updates the Worker script (+ assets, DO, container).
+    // 2. Resolve every workerVars/workerSecrets entry BEFORE deploy so a bad
+    //    reference (unknown import, missing output/secret) fails fast, without
+    //    leaving a deployed-but-unconfigured worker. `resolveWorkerValue` is
+    //    pure — only the wrangler pushes below have side effects. --var values
+    //    additionally ship as part of `wrangler deploy` itself (not a follow-up
+    //    call); secrets are pushed after deploy (step 4) since the script must
+    //    exist first.
+    const resolvedVars = config.workerVars.map((entry) =>
+      resolveWorkerValue(entry, ctx, 'workerVars'),
+    )
+    const resolvedSecrets = config.workerSecrets.map((entry) =>
+      resolveWorkerValue(entry, ctx, 'workerSecrets'),
+    )
+
+    // 3. Deploy. Creates/updates the Worker script (+ assets, DO, container).
     //    --env selects the named wrangler environment (e.g. preview) so it ships
     //    a distinct worker from the same package; --name overrides the worker
     //    name (per-PR preview workers); both omitted = the package's default.
@@ -163,8 +237,9 @@ export const cloudflareModule = defineModule({
     if (config.wranglerEnv) deployArgs.push('--env', config.wranglerEnv)
     if (config.workerName) deployArgs.push('--name', config.workerName)
     if (config.immediateContainerRollout) deployArgs.push('--containers-rollout', 'immediate')
+    for (const { name, value } of resolvedVars) deployArgs.push('--var', `${name}:${value}`)
     console.log(
-      `  Deploying via wrangler (in ${config.workdir})${config.wranglerEnv ? ` [env: ${config.wranglerEnv}]` : ''}${config.workerName ? ` [name: ${config.workerName}]` : ''}${config.immediateContainerRollout ? ' [immediate container rollout]' : ''}`,
+      `  Deploying via wrangler (in ${config.workdir})${config.wranglerEnv ? ` [env: ${config.wranglerEnv}]` : ''}${config.workerName ? ` [name: ${config.workerName}]` : ''}${config.immediateContainerRollout ? ' [immediate container rollout]' : ''}${resolvedVars.length ? ` [vars: ${resolvedVars.map((v) => v.name).join(', ')}]` : ''}`,
     )
     const out = wrangler(workdir, deployArgs, env)
     // Success theater guard: wrangler can exit 0 without actually deploying
@@ -178,41 +253,16 @@ export const cloudflareModule = defineModule({
     const deployUrl = urlMatch?.[0] ?? ''
     console.log(`  Deployed: ${deployUrl || '(URL not parsed — see wrangler output)'}`)
 
-    // 3. Push Worker secrets (after deploy: the script must exist first). Value
-    //    piped via stdin so it never lands in a command string or the log.
-    for (const name of config.workerSecrets) {
-      const value = ctx.secrets[name]
-      if (!value) {
-        throw new Error(
-          `workerSecrets references "${name}" but it's missing from this environment's secrets.yaml`,
-        )
-      }
+    // 4. Push Worker secrets (after deploy: the script must exist first).
+    //    Already resolved in step 2, so a misconfigured reference never reaches
+    //    this point. Value piped via stdin so it never lands in a command
+    //    string or the log.
+    for (const { name, value } of resolvedSecrets) {
       const secretArgs = ['secret', 'put', name]
       if (config.wranglerEnv) secretArgs.push('--env', config.wranglerEnv)
       if (config.workerName) secretArgs.push('--name', config.workerName)
       wrangler(workdir, secretArgs, env, value)
       console.log(`  Set Worker secret: ${name}`)
-    }
-
-    // 4. Sync imported-instance outputs as Worker secrets. Mirrors the vercel
-    //    module's `ctx.imports` env-var pass: each output becomes
-    //    `<INSTANCE>_<OUTPUT>` (upper-cased, hyphens → underscores), so the two
-    //    modules derive identical names from the same imports. Everything goes
-    //    to SECRETS (not wrangler vars): imported outputs include auth tokens
-    //    (e.g. turso's authToken), and pushing them all uniformly beats
-    //    splitting on visibility. Same stdin-piped `secret put` path + --env /
-    //    --name targeting as the workerSecrets loop above.
-    for (const [instanceName, outputs] of Object.entries(ctx.imports)) {
-      if (typeof outputs !== 'object' || outputs === null) continue
-      for (const [key, value] of Object.entries(outputs as Record<string, unknown>)) {
-        if (typeof value !== 'string') continue
-        const secretName = `${instanceName}_${key}`.toUpperCase().replace(/-/g, '_')
-        const secretArgs = ['secret', 'put', secretName]
-        if (config.wranglerEnv) secretArgs.push('--env', config.wranglerEnv)
-        if (config.workerName) secretArgs.push('--name', config.workerName)
-        wrangler(workdir, secretArgs, env, value)
-        console.log(`  Set Worker secret from import: ${secretName} (${instanceName}.${key})`)
-      }
     }
 
     return { deployUrl }
