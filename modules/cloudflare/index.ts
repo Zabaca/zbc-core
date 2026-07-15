@@ -39,7 +39,7 @@ import { defineModule } from '../../src/define-module'
  * IMPORT SYNC: like the vercel module, this module syncs imported-instance
  * outputs into the worker after deploy. Each output of every `ctx.imports`
  * instance is pushed as a Worker secret named `<INSTANCE>_<OUTPUT>` (upper-cased,
- * hyphens to underscores) — the same naming convention the vercel module uses for
+ * hyphens to underscores), the same naming convention the vercel module uses for
  * its project env vars, so the two modules are symmetric (e.g. a `main-db` turso
  * import's `databaseUrl`/`authToken` outputs land as `MAIN_DB_DATABASEURL` /
  * `MAIN_DB_AUTHTOKEN`). Imported values go to Worker SECRETS, not wrangler
