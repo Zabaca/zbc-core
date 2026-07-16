@@ -193,6 +193,13 @@ export const cloudflareModule = defineModule({
   }),
   outputs: z.object({
     deployUrl: z.string(),
+    /**
+     * The deployed Worker's script name, parsed from wrangler's "Deployed
+     * <name> triggers" confirmation. Lets dependents reference this worker
+     * without repeating the name from wrangler.jsonc (e.g. cloudflare-email's
+     * catchAll.workerName as `{ from, output: 'workerName' }`).
+     */
+    workerName: z.string(),
   }),
   async apply(config, ctx) {
     const apiToken = ctx.secrets['CLOUDFLARE_API_TOKEN']
@@ -243,12 +250,15 @@ export const cloudflareModule = defineModule({
     )
     const out = wrangler(workdir, deployArgs, env)
     // Success theater guard: wrangler can exit 0 without actually deploying
-    // (the --bun incident above). Require the deploy confirmation line.
-    if (!/Deployed\s+\S+\s+triggers/.test(out)) {
+    // (the --bun incident above). Require the deploy confirmation line — and
+    // capture the deployed script name from it for the workerName output.
+    const deployedMatch = out.match(/Deployed\s+(\S+)\s+triggers/)
+    if (!deployedMatch) {
       throw new Error(
         `wrangler deploy exited 0 but printed no "Deployed ... triggers" confirmation:\n${out}`,
       )
     }
+    const workerName = deployedMatch[1]!
     const urlMatch = out.match(/https:\/\/[^\s"',]+\.workers\.dev[^\s"',]*/)
     const deployUrl = urlMatch?.[0] ?? ''
     console.log(`  Deployed: ${deployUrl || '(URL not parsed — see wrangler output)'}`)
@@ -265,7 +275,7 @@ export const cloudflareModule = defineModule({
       console.log(`  Set Worker secret: ${name}`)
     }
 
-    return { deployUrl }
+    return { deployUrl, workerName }
   },
   async destroy(config, ctx) {
     const apiToken = ctx.secrets['CLOUDFLARE_API_TOKEN']

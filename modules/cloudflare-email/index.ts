@@ -98,6 +98,47 @@ async function cfFetch<T>(
   return envelope.result
 }
 
+/**
+ * A worker name: either a literal script name, or a `{ from, output }`
+ * reference into an imported instance's outputs (e.g. the cloudflare module
+ * emits `workerName`). References make the coupling refactor-safe — a rename
+ * in wrangler.jsonc flows through automatically, and a typo'd instance or
+ * output is a hard error at apply time instead of a dangling routing rule.
+ */
+const workerRefSchema = z.union([
+  z.string(),
+  z.object({
+    /** Instance name — must be listed in this instance's `imports`. */
+    from: z.string(),
+    /** Which output of that instance holds the worker name. */
+    output: z.string(),
+  }),
+])
+
+type WorkerRef = z.infer<typeof workerRefSchema>
+
+/** Resolve a worker-name entry to its literal string. */
+function resolveWorkerName(
+  ref: WorkerRef,
+  imports: Record<string, unknown>,
+  fieldName: string,
+): string {
+  if (typeof ref === 'string') return ref
+  const instanceOutputs = imports[ref.from]
+  if (instanceOutputs === undefined) {
+    throw new Error(
+      `${fieldName} references instance "${ref.from}", which is not in this instance's imports`,
+    )
+  }
+  const value = (instanceOutputs as Record<string, unknown> | null)?.[ref.output]
+  if (typeof value !== 'string') {
+    throw new Error(
+      `${fieldName} references output "${ref.output}" on instance "${ref.from}", which doesn't emit it`,
+    )
+  }
+  return value
+}
+
 /** A routing rule action target. */
 const addressSchema = z.object({
   /** Local part only — the domain comes from config.domain. */
@@ -105,13 +146,14 @@ const addressSchema = z.object({
   action: z.enum(['forward', 'worker']),
   /** forward: a verified destination address (email). */
   destination: z.string().optional(),
-  /** worker: the deployed Worker script name. */
-  workerName: z.string().optional(),
+  /** worker: the script name, literal or `{ from, output }` import reference. */
+  workerName: workerRefSchema.optional(),
 })
 
 const catchAllSchema = z.object({
   action: z.enum(['worker', 'forward', 'drop']),
-  workerName: z.string().optional(),
+  /** worker: the script name, literal or `{ from, output }` import reference. */
+  workerName: workerRefSchema.optional(),
   destination: z.string().optional(),
 })
 
@@ -132,17 +174,18 @@ interface SendingSubdomain {
 /** Managed-rule marker so destroy only removes rules this module created. */
 const RULE_PREFIX = 'zbc:'
 
-function ruleAction(entry: { action: string; destination?: string; workerName?: string }): {
-  type: string
-  value?: string[]
-} {
+function ruleAction(
+  entry: { action: string; destination?: string; workerName?: WorkerRef },
+  imports: Record<string, unknown>,
+  fieldName: string,
+): { type: string; value?: string[] } {
   if (entry.action === 'forward') {
-    if (!entry.destination) throw new Error(`action "forward" requires a destination`)
+    if (!entry.destination) throw new Error(`${fieldName}: action "forward" requires a destination`)
     return { type: 'forward', value: [entry.destination] }
   }
   if (entry.action === 'worker') {
-    if (!entry.workerName) throw new Error(`action "worker" requires a workerName`)
-    return { type: 'worker', value: [entry.workerName] }
+    if (!entry.workerName) throw new Error(`${fieldName}: action "worker" requires a workerName`)
+    return { type: 'worker', value: [resolveWorkerName(entry.workerName, imports, fieldName)] }
   }
   return { type: 'drop' }
 }
@@ -343,7 +386,7 @@ export const cloudflareEmailModule = defineModule({
           name: ruleName,
           enabled: true,
           matchers: [{ type: 'literal', field: 'to', value: email }],
-          actions: [ruleAction(entry)],
+          actions: [ruleAction(entry, ctx.imports, `addresses[${entry.localPart}]`)],
         }
         const existing = existingRules.find(
           (r) =>
@@ -370,7 +413,7 @@ export const cloudflareEmailModule = defineModule({
             name: `${RULE_PREFIX}catch-all`,
             enabled: true,
             matchers: [{ type: 'all' }],
-            actions: [ruleAction(config.catchAll)],
+            actions: [ruleAction(config.catchAll, ctx.imports, 'catchAll')],
           },
         })
         console.log(`  Routing: catch-all → ${config.catchAll.action}`)
