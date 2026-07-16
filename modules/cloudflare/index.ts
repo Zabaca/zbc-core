@@ -87,12 +87,20 @@ const buildSchema = z.object({
 })
 
 /**
- * A worker secret/var entry: either a plain name (resolved from this
- * environment's secrets.yaml) or a reference into an imported instance's
- * outputs (`ctx.imports[from][output]`).
+ * A worker secret/var entry: a plain name (resolved from this environment's
+ * secrets.yaml), a `{ name, value }` literal (vars that are per-instance
+ * config rather than secrets — e.g. DEFAULT_FROM — so a generic wrangler.jsonc
+ * needs no editing), or a `{ name, from, output }` reference into an imported
+ * instance's outputs (`ctx.imports[from][output]`).
  */
 const workerValueSchema = z.union([
   z.string(),
+  z.object({
+    /** Env var name inside the Worker. */
+    name: z.string(),
+    /** Literal value, straight from this instance's config file. */
+    value: z.string(),
+  }),
   z.object({
     /** Env var name inside the Worker. */
     name: z.string(),
@@ -121,6 +129,10 @@ function resolveWorkerValue(
     return { name: entry, value }
   }
 
+  if ('value' in entry) {
+    return { name: entry.name, value: entry.value }
+  }
+
   const instanceOutputs = ctx.imports[entry.from]
   if (instanceOutputs === undefined) {
     throw new Error(
@@ -134,6 +146,165 @@ function resolveWorkerValue(
     )
   }
   return { name: entry.name, value }
+}
+
+/**
+ * An R2 binding override: which bucket the named `r2_buckets` binding in the
+ * package's wrangler config should attach to. Either a literal bucket name or
+ * a `{ from, output }` reference into an imported instance's outputs (the r2
+ * module emits `bucketName`). Wrangler has no CLI flag for this, so the module
+ * patches a generated copy of the wrangler config and deploys with --config —
+ * which is what lets a scaffolded package's wrangler.jsonc stay generic while
+ * the per-project bucket name lives in the instance file.
+ */
+const r2BindingSchema = z.union([
+  z.object({
+    /** Binding name inside the Worker (the `binding` field in r2_buckets). */
+    binding: z.string(),
+    /** Literal bucket name. */
+    bucketName: z.string(),
+  }),
+  z.object({
+    binding: z.string(),
+    /** Instance name — must be listed in this instance's `imports`. */
+    from: z.string(),
+    /** Which output of that instance holds the bucket name. */
+    output: z.string(),
+  }),
+])
+
+type R2BindingEntry = z.infer<typeof r2BindingSchema>
+
+function resolveR2Binding(
+  entry: R2BindingEntry,
+  ctx: { imports: Record<string, unknown> },
+): { binding: string; bucketName: string } {
+  if ('bucketName' in entry) return { binding: entry.binding, bucketName: entry.bucketName }
+  const instanceOutputs = ctx.imports[entry.from]
+  if (instanceOutputs === undefined) {
+    throw new Error(
+      `r2Bindings entry "${entry.binding}" references instance "${entry.from}", which is not in this instance's imports`,
+    )
+  }
+  const value = (instanceOutputs as Record<string, unknown> | null)?.[entry.output]
+  if (typeof value !== 'string') {
+    throw new Error(
+      `r2Bindings entry "${entry.binding}" references output "${entry.output}" on instance "${entry.from}", which doesn't emit it`,
+    )
+  }
+  return { binding: entry.binding, bucketName: value }
+}
+
+/** Strip line and block comments from JSONC, string-aware. */
+function stripJsoncComments(src: string): string {
+  let out = ''
+  let i = 0
+  let inStr = false
+  while (i < src.length) {
+    const c = src[i]!
+    if (inStr) {
+      out += c
+      if (c === '\\') {
+        out += src[i + 1] ?? ''
+        i += 2
+        continue
+      }
+      if (c === '"') inStr = false
+      i++
+      continue
+    }
+    if (c === '"') {
+      inStr = true
+      out += c
+      i++
+      continue
+    }
+    if (c === '/' && src[i + 1] === '/') {
+      while (i < src.length && src[i] !== '\n') i++
+      continue
+    }
+    if (c === '/' && src[i + 1] === '*') {
+      i += 2
+      while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) i++
+      i += 2
+      continue
+    }
+    out += c
+    i++
+  }
+  return out
+}
+
+/** Remove trailing commas (`,}` / `,]`), string-aware — JSONC allows them. */
+function stripTrailingCommas(src: string): string {
+  let out = ''
+  let inStr = false
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i]!
+    if (inStr) {
+      out += c
+      if (c === '\\') {
+        out += src[i + 1] ?? ''
+        i++
+        continue
+      }
+      if (c === '"') inStr = false
+      continue
+    }
+    if (c === '"') {
+      inStr = true
+      out += c
+      continue
+    }
+    if (c === ',') {
+      let j = i + 1
+      while (j < src.length && /\s/.test(src[j]!)) j++
+      if (src[j] === '}' || src[j] === ']') continue
+    }
+    out += c
+  }
+  return out
+}
+
+interface WranglerR2Entry {
+  binding: string
+  bucket_name?: string
+}
+
+/**
+ * Rewrite `bucket_name` for each resolved r2Bindings entry, in the top-level
+ * `r2_buckets` and (when `wranglerEnv` is set) the matching `env.<name>` block.
+ * A binding with no matching r2_buckets entry is a hard config error.
+ */
+function patchR2Buckets(
+  config: Record<string, unknown>,
+  resolved: Array<{ binding: string; bucketName: string }>,
+  wranglerEnv?: string,
+): void {
+  const blocks: Array<Record<string, unknown>> = [config]
+  if (wranglerEnv) {
+    const envBlock = (config.env as Record<string, Record<string, unknown>> | undefined)?.[
+      wranglerEnv
+    ]
+    if (envBlock) blocks.push(envBlock)
+  }
+  for (const { binding, bucketName } of resolved) {
+    let found = false
+    for (const block of blocks) {
+      const entry = (block.r2_buckets as WranglerR2Entry[] | undefined)?.find(
+        (b) => b.binding === binding,
+      )
+      if (entry) {
+        entry.bucket_name = bucketName
+        found = true
+      }
+    }
+    if (!found) {
+      throw new Error(
+        `r2Bindings entry "${binding}" has no matching r2_buckets binding in the package's wrangler config`,
+      )
+    }
+  }
 }
 
 export const cloudflareModule = defineModule({
@@ -164,6 +335,14 @@ export const cloudflareModule = defineModule({
      * route sensitive values through this field.
      */
     workerVars: z.array(workerValueSchema).default([]),
+    /**
+     * Override which R2 bucket each named `r2_buckets` binding attaches to.
+     * Entries are `{ binding, bucketName }` literals or `{ binding, from,
+     * output }` references into an imported instance's outputs (the r2 module
+     * emits `bucketName`). Lets the package's wrangler config stay generic —
+     * the per-project bucket lives here, next to the other identifiers.
+     */
+    r2Bindings: z.array(r2BindingSchema).default([]),
     /**
      * For container-backed Workers: roll the running container to the new image
      * IMMEDIATELY on deploy (`--containers-rollout immediate`). The wrangler
@@ -235,20 +414,50 @@ export const cloudflareModule = defineModule({
     const resolvedSecrets = config.workerSecrets.map((entry) =>
       resolveWorkerValue(entry, ctx, 'workerSecrets'),
     )
+    const resolvedR2 = config.r2Bindings.map((entry) => resolveR2Binding(entry, ctx))
+
+    // 2b. r2Bindings: wrangler has no CLI flag for bucket overrides, so patch
+    //     a generated copy of the package's wrangler config and deploy with
+    //     --config. Written next to the original so relative paths (main,
+    //     assets dir) still resolve; comments don't survive the round-trip,
+    //     but the file is throwaway (deleted after deploy).
+    let generatedConfig: string | undefined
+    if (resolvedR2.length > 0) {
+      const configPath = ['wrangler.jsonc', 'wrangler.json']
+        .map((f) => path.join(workdir, f))
+        .find((f) => fs.existsSync(f))
+      if (!configPath) {
+        throw new Error(
+          `r2Bindings requires a wrangler.jsonc/wrangler.json in ${config.workdir} (wrangler.toml is not supported)`,
+        )
+      }
+      const parsed = JSON.parse(
+        stripTrailingCommas(stripJsoncComments(fs.readFileSync(configPath, 'utf8'))),
+      ) as Record<string, unknown>
+      patchR2Buckets(parsed, resolvedR2, config.wranglerEnv)
+      generatedConfig = path.join(workdir, 'wrangler.zbc-generated.json')
+      fs.writeFileSync(generatedConfig, JSON.stringify(parsed, null, 2))
+    }
 
     // 3. Deploy. Creates/updates the Worker script (+ assets, DO, container).
     //    --env selects the named wrangler environment (e.g. preview) so it ships
     //    a distinct worker from the same package; --name overrides the worker
     //    name (per-PR preview workers); both omitted = the package's default.
     const deployArgs = ['deploy']
+    if (generatedConfig) deployArgs.push('--config', generatedConfig)
     if (config.wranglerEnv) deployArgs.push('--env', config.wranglerEnv)
     if (config.workerName) deployArgs.push('--name', config.workerName)
     if (config.immediateContainerRollout) deployArgs.push('--containers-rollout', 'immediate')
     for (const { name, value } of resolvedVars) deployArgs.push('--var', `${name}:${value}`)
     console.log(
-      `  Deploying via wrangler (in ${config.workdir})${config.wranglerEnv ? ` [env: ${config.wranglerEnv}]` : ''}${config.workerName ? ` [name: ${config.workerName}]` : ''}${config.immediateContainerRollout ? ' [immediate container rollout]' : ''}${resolvedVars.length ? ` [vars: ${resolvedVars.map((v) => v.name).join(', ')}]` : ''}`,
+      `  Deploying via wrangler (in ${config.workdir})${config.wranglerEnv ? ` [env: ${config.wranglerEnv}]` : ''}${config.workerName ? ` [name: ${config.workerName}]` : ''}${config.immediateContainerRollout ? ' [immediate container rollout]' : ''}${resolvedVars.length ? ` [vars: ${resolvedVars.map((v) => v.name).join(', ')}]` : ''}${resolvedR2.length ? ` [r2: ${resolvedR2.map((b) => `${b.binding}→${b.bucketName}`).join(', ')}]` : ''}`,
     )
-    const out = wrangler(workdir, deployArgs, env)
+    let out: string
+    try {
+      out = wrangler(workdir, deployArgs, env)
+    } finally {
+      if (generatedConfig) fs.rmSync(generatedConfig, { force: true })
+    }
     // Success theater guard: wrangler can exit 0 without actually deploying
     // (the --bun incident above). Require the deploy confirmation line — and
     // capture the deployed script name from it for the workerName output.
