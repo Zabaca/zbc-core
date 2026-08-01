@@ -5,13 +5,25 @@ import { defineModule } from '../../src/define-module'
 /**
  * Retry `probe` until it stops throwing.
  *
- * DEFENSIVE, not a fix for anything observed. A freshly created database can
- * exist in the control plane before its HTTP endpoint answers, which would
- * surface as a 404 on the first connection and read like a migration failure.
- * That is a real property of the service, but it is NOT what broke preview
- * deploys on 2026-08-01: that was the guessed hostname below, and this wait
- * has never been seen to retry even once. Delete it if it stays that way;
- * do not cite it as the cause of a past incident.
+ * WHY, stated carefully, because THREE confident explanations for this have
+ * already been wrong (two mine, one a reviewer's). On 2026-08-01 a preview
+ * deploy 404'd connecting to a database created 326ms earlier. The root cause
+ * was never established. What IS established, each checked rather than
+ * reasoned:
+ *
+ *   - Only the fastest run failed. Four creates, by create-to-connect gap:
+ *     326ms 404, 662ms OK, 1263ms OK, 1414ms OK.
+ *   - The `<db>-<org>.turso.io` URL the old code built was NOT the cause. It
+ *     still answers 200, and two earlier previews created databases and
+ *     migrated through it fine.
+ *   - A create-then-connect race did NOT reproduce from a workstation: three
+ *     fresh databases answered at ~140ms. That rules it out from here, not
+ *     from CI, which runs on a different network.
+ *
+ * So: a bounded retry for a transient failure whose mechanism is unknown, not
+ * a fix for a diagnosed bug. If it fires, capture the timing and the response
+ * body, because that is the evidence nobody has yet. Do not write a cause into
+ * this comment without evidence that survives someone trying to break it.
  *
  * Probes reachability rather than retrying migrate() itself, so a genuine
  * migration error still fails on the first try instead of being attempted
@@ -104,13 +116,14 @@ export const tursoModule = defineModule({
       }
 
       const created = await turso.databases.create(config.dbName, { group: config.group })
-      // Use the hostname the API RETURNS, never a template. This was guessed
-      // as `<db>-<org>.turso.io` and real hostnames carry a region segment:
-      //   foothillmetabolic-pr-7-zabaca.aws-us-west-2.turso.io
-      // so every newly created database got an unreachable URL and 404'd on
-      // its first connection. It hid for months because the `existing` branch
-      // reads the real hostname, so a long-lived database is always right and
-      // only a first-ever apply (every per-PR preview) took the broken path.
+      // Use the hostname the API RETURNS rather than rebuilding it. The old
+      // code guessed `<db>-<org>.turso.io`; the API hands back a
+      // region-qualified name (`...-zabaca.aws-us-west-2.turso.io`).
+      //
+      // HYGIENE, NOT A FIX. Both forms currently answer 200, so the guess did
+      // not cause the 2026-08-01 failure; an earlier version of this comment
+      // said it did and was wrong. The reason to stop guessing is that the
+      // format is not ours to depend on, not that it is broken today.
       hostname = created.hostname
       console.log(`  Created database "${config.dbName}" in group "${config.group}"`)
     }
