@@ -27,6 +27,7 @@ input="$(cat)"
 {
   printf '<<<CALL\\n'
   printf 'argv=%s\\n' "$*"
+  printf 'token=%s\\n' "$CLOUDFLARE_API_TOKEN"
   printf 'stdin=%s\\n' "$input"
   printf 'CALL>>>\\n'
 } >> "$STUB_LOG"
@@ -40,16 +41,17 @@ exit 0
 
 interface WranglerCall {
   argv: string[]
+  token: string
   stdin: string
 }
 
-/** Parse the stub's log into an ordered list of `{ argv, stdin }` calls. */
+/** Parse the stub's log into an ordered list of `{ argv, token, stdin }` calls. */
 function parseCalls(log: string): WranglerCall[] {
   const calls: WranglerCall[] = []
-  const re = /<<<CALL\nargv=(.*)\nstdin=([\s\S]*?)\nCALL>>>/g
+  const re = /<<<CALL\nargv=(.*)\ntoken=(.*)\nstdin=([\s\S]*?)\nCALL>>>/g
   let m: RegExpExecArray | null
   while ((m = re.exec(log)) !== null) {
-    calls.push({ argv: m[1].length ? m[1].split(' ') : [], stdin: m[2] })
+    calls.push({ argv: m[1].length ? m[1].split(' ') : [], token: m[2], stdin: m[3] })
   }
   return calls
 }
@@ -67,6 +69,8 @@ afterEach(() => {
 async function runApply(opts: {
   config?: Record<string, unknown>
   secrets?: Record<string, string>
+  /** Replace the secrets map entirely (no default CLOUDFLARE_API_TOKEN). */
+  bareSecrets?: Record<string, string>
   imports?: Record<string, unknown>
 }): Promise<{ result?: { deployUrl: string }; error?: Error; calls: WranglerCall[] }> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-stub-'))
@@ -88,7 +92,7 @@ async function runApply(opts: {
     ...opts.config,
   })
   const ctx = {
-    secrets: { CLOUDFLARE_API_TOKEN: 'cf-token', ...opts.secrets },
+    secrets: opts.bareSecrets ?? { CLOUDFLARE_API_TOKEN: 'cf-token', ...opts.secrets },
     imports: opts.imports ?? {},
     projectRoot: root,
   }
@@ -172,6 +176,53 @@ describe('cloudflare apply — import-reference resolution (ctx.imports)', () =>
     expect(secrets[0].stdin).toBe('tok-123')
     // An imported auth token must not leak onto the deploy command line.
     expect(deployCall(calls)?.argv.join(' ')).not.toContain('tok-123')
+  })
+})
+
+describe('cloudflare apply — apiToken from an imported instance', () => {
+  test('apiToken { from, output } → wrangler runs with the imported value, not secrets.yaml', async () => {
+    const { error, calls } = await runApply({
+      config: { apiToken: { from: 'deploy-token', output: 'tokenValue' } },
+      imports: { 'deploy-token': { tokenValue: 'minted-tok', tokenId: 'tok-1' } },
+    })
+    expect(error).toBeUndefined()
+    const deploy = deployCall(calls)
+    expect(deploy?.token).toBe('minted-tok')
+  })
+
+  test('omitted apiToken keeps the secrets.yaml fallback', async () => {
+    const { error, calls } = await runApply({})
+    expect(error).toBeUndefined()
+    expect(deployCall(calls)?.token).toBe('cf-token')
+  })
+
+  test('apiToken referencing an instance not in imports → fail-fast, no wrangler', async () => {
+    const { error, calls } = await runApply({
+      config: { apiToken: { from: 'ghost', output: 'tokenValue' } },
+      imports: {},
+    })
+    expect(error).toBeDefined()
+    expect(error!.message).toContain('ghost')
+    expect(error!.message).toContain('apiToken')
+    expect(calls).toHaveLength(0)
+  })
+
+  test('apiToken referencing an output the instance does not emit → fail-fast', async () => {
+    const { error, calls } = await runApply({
+      config: { apiToken: { from: 'deploy-token', output: 'missing' } },
+      imports: { 'deploy-token': { tokenValue: 'minted-tok' } },
+    })
+    expect(error).toBeDefined()
+    expect(error!.message).toContain('missing')
+    expect(error!.message).toContain('deploy-token')
+    expect(calls).toHaveLength(0)
+  })
+
+  test('no apiToken config and no CLOUDFLARE_API_TOKEN secret → clear error, no wrangler', async () => {
+    const { error, calls } = await runApply({ bareSecrets: {} })
+    expect(error).toBeDefined()
+    expect(error!.message).toContain('CLOUDFLARE_API_TOKEN')
+    expect(calls).toHaveLength(0)
   })
 })
 

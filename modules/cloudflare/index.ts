@@ -317,6 +317,17 @@ export const cloudflareModule = defineModule({
      * it lives in config — only the API token is held in secrets.yaml.
      */
     accountId: z.string(),
+    /**
+     * Where the deploy credential comes from. Omit to read
+     * `CLOUDFLARE_API_TOKEN` from this environment's secrets.yaml (the
+     * original behavior). Set `{ from, output }` to pull it from an imported
+     * instance's outputs instead — e.g. a `cloudflare-token` instance's
+     * `tokenValue` — so a minted, per-apply-rolled deploy token flows straight
+     * to wrangler and never sits at rest. NOTE: the engine passes no imports
+     * to `destroy`, so environments that destroy workers (ephemeral previews)
+     * still need the secrets.yaml fallback for teardown.
+     */
+    apiToken: z.object({ from: z.string(), output: z.string() }).optional(),
     /** Optional local build run before deploy (e.g. `vite build` for assets). */
     build: buildSchema.optional(),
     /**
@@ -381,7 +392,13 @@ export const cloudflareModule = defineModule({
     workerName: z.string(),
   }),
   async apply(config, ctx) {
-    const apiToken = ctx.secrets['CLOUDFLARE_API_TOKEN']
+    // Deploy credential: an imported instance's output (e.g. cloudflare-token's
+    // tokenValue) when `apiToken` is set, else secrets.yaml. Resolved before
+    // anything runs so a bad reference fails fast.
+    const apiToken = config.apiToken
+      ? resolveWorkerValue({ name: 'CLOUDFLARE_API_TOKEN', ...config.apiToken }, ctx, 'apiToken')
+          .value
+      : ctx.secrets['CLOUDFLARE_API_TOKEN']
     if (!apiToken) throw new Error('Missing secret: CLOUDFLARE_API_TOKEN')
 
     const env: NodeJS.ProcessEnv = {
@@ -487,8 +504,27 @@ export const cloudflareModule = defineModule({
     return { deployUrl, workerName }
   },
   async destroy(config, ctx) {
-    const apiToken = ctx.secrets['CLOUDFLARE_API_TOKEN']
-    if (!apiToken) throw new Error('Missing secret: CLOUDFLARE_API_TOKEN')
+    // The engine passes `imports: {}` to destroy (reverse-order teardown — the
+    // imported instance may already be gone), so an `apiToken` reference can't
+    // resolve here. Fall back to secrets.yaml; error only when neither exists.
+    let apiToken: string | undefined
+    if (config.apiToken) {
+      try {
+        apiToken = resolveWorkerValue(
+          { name: 'CLOUDFLARE_API_TOKEN', ...config.apiToken },
+          ctx,
+          'apiToken',
+        ).value
+      } catch {
+        apiToken = undefined
+      }
+    }
+    apiToken ??= ctx.secrets['CLOUDFLARE_API_TOKEN']
+    if (!apiToken) {
+      throw new Error(
+        'Missing secret: CLOUDFLARE_API_TOKEN (the apiToken import is not available at destroy — keep a CLOUDFLARE_API_TOKEN in secrets.yaml for environments that destroy workers)',
+      )
+    }
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       CLOUDFLARE_API_TOKEN: apiToken,
