@@ -15,7 +15,10 @@ const sh = (cmd: string) => execSync(cmd, { stdio: ['ignore', 'pipe', 'pipe'] })
 export const systemdUnitModule = defineModule({
   name: 'systemd-unit',
   configSchema: z.object({
-    unit: z.string(), // e.g. "foundry-transcribe.service"
+    // e.g. "foundry-transcribe.service". Restricted to systemd-legal name
+    // characters — the name is interpolated into shell commands below, so
+    // whitespace/metacharacters are config errors, not injection vectors.
+    unit: z.string().regex(/^[A-Za-z0-9:@_.\\-]+$/, 'not a plain systemd unit name'),
     content: z.string(),
     scope: z.enum(['user', 'system']).default('user'),
     enableNow: z.boolean().default(true),
@@ -36,17 +39,28 @@ export const systemdUnitModule = defineModule({
         fs.mkdirSync(dir, { recursive: true })
         fs.writeFileSync(unitPath, config.content)
       } else {
-        execSync(`sudo tee ${unitPath} > /dev/null`, { input: config.content })
+        execSync(`sudo tee "${unitPath}" > /dev/null`, { input: config.content })
       }
       sh(`${ctl} daemon-reload`)
     }
-    if (user) sh(`loginctl enable-linger ${os.userInfo().username} || true`)
+    if (user) sh(`loginctl enable-linger "${os.userInfo().username}" || true`)
     if (config.enableNow) {
-      sh(`${ctl} enable ${config.unit} 2>&1 || true`)
-      if (changed) sh(`${ctl} restart ${config.unit}`)
-      else sh(`${ctl} start ${config.unit}`)
+      // enable is idempotent (exit 0 when already enabled). Static units (no
+      // [Install] section) are the one legitimate failure to tolerate — a bad
+      // unit name or broken content must surface here, not as a worse error
+      // from the start below.
+      try {
+        sh(`${ctl} enable "${config.unit}" 2>&1`)
+      } catch (err) {
+        const e = err as Error & { stdout?: Buffer; stderr?: Buffer }
+        const msg = [e.message, e.stdout?.toString(), e.stderr?.toString()].join('\n')
+        if (!/installation config|not.*enabl/i.test(msg)) throw err
+        console.log(`  ${config.unit}: static unit, enable skipped`)
+      }
+      if (changed) sh(`${ctl} restart "${config.unit}"`)
+      else sh(`${ctl} start "${config.unit}"`)
     }
-    const active = sh(`${ctl} is-active ${config.unit} || true`).trim() === 'active'
+    const active = sh(`${ctl} is-active "${config.unit}" || true`).trim() === 'active'
     console.log(`  ${config.unit} ${changed ? 'updated' : 'unchanged'}, active=${active}`)
     return { unit: config.unit, changed, active }
   },

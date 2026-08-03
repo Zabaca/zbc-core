@@ -31,11 +31,15 @@ export const hostFileModule = defineModule({
       ? fs.readFileSync(config.path, 'utf8')
       : null
     const changed = existing !== desired
+    const mode = parseInt(config.mode, 8)
     if (changed) {
       fs.mkdirSync(path.dirname(config.path), { recursive: true })
-      fs.writeFileSync(config.path, desired)
+      // mode at create time — a default-umask write followed by chmod leaves
+      // a window where a secret-bearing file is world-readable. (The mode
+      // option is ignored when overwriting; chmodSync below converges that.)
+      fs.writeFileSync(config.path, desired, { mode })
     }
-    fs.chmodSync(config.path, parseInt(config.mode, 8))
+    fs.chmodSync(config.path, mode)
     console.log(`  ${config.path} ${changed ? 'written' : 'unchanged'}`)
     return { path: config.path, changed }
   },

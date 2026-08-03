@@ -10,7 +10,9 @@ export const dockerComposeStackModule = defineModule({
   name: 'docker-compose-stack',
   configSchema: z.object({
     dir: z.string(),
-    services: z.array(z.string()).default([]), // empty = whole stack
+    // empty = whole stack. Names are interpolated into the compose command —
+    // compose-legal characters only, so a stray space is a config error.
+    services: z.array(z.string().regex(/^[A-Za-z0-9_.-]+$/, 'not a compose service name')).default([]),
   }),
   outputs: z.object({ dir: z.string(), running: z.number() }),
   apply: async (config) => {

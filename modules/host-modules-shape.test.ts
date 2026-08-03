@@ -35,3 +35,28 @@ describe('host-converging modules parse in the core layout', () => {
     expect(dockerComposeStackModule.configSchema.parse({ dir: '/srv/app' }).services).toEqual([])
   })
 })
+
+test('host-file creates secret-bearing files with the target mode from the first byte', async () => {
+  const fs = await import('node:fs')
+  const os = await import('node:os')
+  const path = await import('node:path')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hostfile-'))
+  try {
+    const dest = path.join(dir, 'secret.env')
+    const config = hostFileModule.configSchema.parse({
+      path: dest,
+      secretKey: 'TOKEN',
+      mode: '0600',
+    })
+    await hostFileModule.apply(config, {
+      secrets: { TOKEN: 'v' },
+      imports: {},
+      projectRoot: dir,
+    })
+    // No world-readable window: the file must be created 0600, not merely
+    // chmod'ed to it after a default-umask write.
+    expect(fs.statSync(dest).mode & 0o777).toBe(0o600)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
