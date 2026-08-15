@@ -1,5 +1,4 @@
 import { z } from 'zod'
-import { createClient } from '@tursodatabase/api'
 import { defineModule } from '../../src/define-module'
 
 /**
@@ -74,6 +73,13 @@ export const tursoModule = defineModule({
     const apiToken = ctx.secrets['TURSO_API_TOKEN']
     if (!apiToken) throw new Error('Missing secret: TURSO_API_TOKEN')
 
+    // Imported here rather than at the top of the file, the way the migration
+    // dependencies below already are: a consumer that vendors zbc-core but
+    // declares no turso instance never installs `@tursodatabase/api`, and an
+    // eager import makes merely *loading* this module throw for them — which
+    // took `reachable.test.ts` down with it, a test that touches no client at
+    // all. Nothing needs the API client until an apply actually runs.
+    const { createClient } = await import('@tursodatabase/api')
     const turso = createClient({ org: config.orgName, token: apiToken })
 
     // For ephemeral databases, destroy first to get a clean state
@@ -167,6 +173,7 @@ export const tursoModule = defineModule({
     const apiToken = ctx.secrets['TURSO_API_TOKEN']
     if (!apiToken) throw new Error('Missing secret: TURSO_API_TOKEN')
 
+    const { createClient } = await import('@tursodatabase/api')
     const turso = createClient({ org: config.orgName, token: apiToken })
 
     try {
