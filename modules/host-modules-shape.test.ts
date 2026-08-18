@@ -179,3 +179,45 @@ test('host-dir converges through the host-exec seam, so the sibling edge resolve
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// ── A citation that belongs to another repository has to say so ─────────────
+//
+// The promoted files keep foundry's bare `ADR-NNNN` and ticket references
+// rather than having them stripped, on the stated argument that "a reference a
+// reader can go and find beats a rationale nobody can check". That argument
+// only holds if the reader is told whose numbering it is. `ADR-0023` resolves
+// to nothing here — and, worse than nothing, this repository is free to mint an
+// ADR-0023 of its own tomorrow, at which point the citation reads as a live
+// reference to the wrong document.
+//
+// The rule arrived as a sentence in a header comment and arrived half-kept:
+// `host-exec/index.test.ts` cited ADR-0023 twice with nothing in the file
+// naming foundry at all, and `host-exec/index.ts` had lost two citations in a
+// paragraph rewrite. Both were invisible, because a policy written in prose has
+// no failure surface. This is the same policy as a computation.
+test('every file citing a bare ADR number names the repository those ADRs belong to', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+
+  const sources = fs
+    .readdirSync(import.meta.dir, { recursive: true, encoding: 'utf8' })
+    .filter((p) => p.endsWith('.ts'))
+    .map((p) => ({ p, text: fs.readFileSync(path.join(import.meta.dir, p), 'utf8') }))
+
+  // The walk itself, before anything is concluded from it: a mistyped root or a
+  // changed readdir signature would make every claim below vacuously true.
+  expect(sources.length).toBeGreaterThanOrEqual(10)
+
+  const citing = sources.filter((s) => /ADR-\d{4}/.test(s.text)).map((s) => s.p)
+  // Floor of three against four today. Not a count to keep in step — a file is
+  // free to stop citing — but a filter that matched nothing must not read as a
+  // clean sweep.
+  expect(citing.length).toBeGreaterThanOrEqual(3)
+  // Named because it is the file the guard was written for.
+  expect(citing).toContain(path.join('host-exec', 'index.test.ts'))
+
+  const unattributed = sources
+    .filter((s) => /ADR-\d{4}/.test(s.text) && !/foundry/i.test(s.text))
+    .map((s) => s.p)
+  expect(unattributed).toEqual([])
+})

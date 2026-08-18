@@ -41,13 +41,14 @@ import { execSync } from 'node:child_process'
 // Widening the engine's own contract to carry a property only tests observe
 // makes every consumer pay for one consumer's test strategy — the seam is a
 // module-layer concern and `src/types.ts` is the wrong place to express it.
+// ADR-0023.
 //
 // In foundry, where this was written, that argument came second: `ApplyContext`
-// was reachable only through the `vendor/zbc/` subtree, whose commits may not
-// mix with other paths, so widening it meant a push-and-pull round trip per
-// iteration. That half no longer applies here — this file now lives beside
-// `src/types.ts` — and it is recorded rather than deleted because the reason
-// that survives is the one that generalises.
+// was reachable only through the `vendor/zbc/` subtree, whose commits ADR-0007
+// forbids mixing with other paths, so widening it meant a push-and-pull round
+// trip per iteration. That half no longer applies here — this file now lives
+// beside `src/types.ts` — and it is recorded rather than deleted because the
+// reason that survives is the one that generalises.
 //
 // **Why not a mock library.** A library asserts on *calls*. What makes the
 // Cloudflare tests honest is that their stub is a small in-memory version of the

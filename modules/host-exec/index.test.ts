@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import { type Exec, exec, execStatus, withExec } from './index'
 
+// Contributed from foundry, 2026-08-18, with `host-exec/index.ts`. The
+// `ADR-NNNN` numbers and the `remote-guests/NN` ticket ids below are
+// **foundry's**, not this repository's — kept rather than stripped for the
+// reason its sibling gives, and named here so a reader does not resolve them
+// against an ADR of the same number that this repository may mint later.
+//
 // The seam has to be held to the standard it was built to impose.
 //
 // `tailscale-serve`'s tests now run its real `apply` against a fake machine, and
