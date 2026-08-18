@@ -1,0 +1,8 @@
+{
+  "name": "host-exec",
+  "description": "The seam every host-converging module reaches the machine through — one `exec`, substitutable in a test with `withExec`, so an `apply` that shells out can be exercised instead of merely parsed",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {},
+  "secrets": [],
+  "instructions": "Not a module: it exports no defineModule and declares no instance. It is the library `host-dir` (and, in the contributing repo, a dozen others) import as `../host-exec`, plus the `withExec` a test wraps an apply in. In vendor mode the whole subtree is present, so the sibling import resolves with nothing to install. In COPY mode `zbc add host-dir` copies only host-dir — run `zbc add host-exec` as well, or the relative import dangles; the registry manifest has no field for one module depending on another."
+}
