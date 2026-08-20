@@ -75,7 +75,11 @@ function installFetchStub(state: StubState): { calls: RecordedCall[] } {
     if (method === 'DELETE' && /\/tokens\/[^/]+$/.test(path)) {
       return respond(envelope({ id: path.split('/').pop() }))
     }
-    return respond({ success: false, errors: [{ message: `no stub route: ${method} ${path}` }], result: null })
+    return respond({
+      success: false,
+      errors: [{ message: `no stub route: ${method} ${path}` }],
+      result: null,
+    })
   }) as typeof fetch
 
   return { calls }
@@ -120,6 +124,87 @@ async function runApply(opts: {
 
 const byMethod = (calls: RecordedCall[], method: string, urlPart: string) =>
   calls.filter((c) => c.method === method && c.url.includes(urlPart))
+
+// ── a permission name that denotes two groups ───────────────────────────────
+//
+// Cloudflare publishes several permission names TWICE, once account-scoped and
+// once zone-scoped — "Access: Apps and Policies Write" is one. A resolver that
+// takes the first match by name silently picks whichever the API happened to
+// order first, so a token can end up holding the permission at the wrong
+// resource level: granted on every zone, absent at the account. The dashboard
+// shows the permission plainly present, and `POST /accounts/{id}/access/apps`
+// answers 403, which reads like a scope problem rather than a resolution bug.
+//
+// Measured on a live account on 2026-08-19: a token minted by the `find`
+// version could read `/access/service_tokens` and could not create an app,
+// while the same declaration applied from a checkout carrying the fix worked.
+// Two repos, one account, one token id — the only difference was this line.
+const DUAL_SCOPE_GROUPS = [
+  ...GROUPS,
+  {
+    id: 'pg-access-account',
+    name: 'Access: Apps and Policies Write',
+    scopes: ['com.cloudflare.api.account'],
+  },
+  {
+    id: 'pg-access-zone',
+    name: 'Access: Apps and Policies Write',
+    scopes: ['com.cloudflare.api.account.zone'],
+  },
+]
+
+describe('a permission name that denotes two groups', () => {
+  test('grants both, so neither resource level is dropped', async () => {
+    const { error, calls } = await runApply({
+      config: { permissions: ['Access: Apps and Policies Write'], zones: ['cedarpad.com'] },
+      state: {
+        permissionGroups: DUAL_SCOPE_GROUPS,
+        zones: { 'cedarpad.com': 'zone-1' },
+        createdValue: 'v-created',
+      },
+    })
+    expect(error).toBeUndefined()
+
+    const posts = byMethod(calls, 'POST', '/accounts/acct-1/tokens')
+    expect(posts).toHaveLength(1)
+    const policies = (
+      posts[0].body as {
+        policies: Array<{
+          permission_groups: Array<{ id: string }>
+          resources: Record<string, unknown>
+        }>
+      }
+    ).policies
+
+    const granted = policies
+      .flatMap((policy) => policy.permission_groups.map((group) => group.id))
+      .sort()
+    expect(granted).toEqual(['pg-access-account', 'pg-access-zone'])
+
+    // And each lands on the policy for its own scope, which is what picking the
+    // permission in the dashboard does. Asserted by pairing id to resource
+    // rather than by counting policies: a resolver that granted both ids on one
+    // policy would satisfy the sweep above and still be wrong.
+    const accountPolicy = policies.find((policy) =>
+      policy.permission_groups.some((group) => group.id === 'pg-access-account'),
+    )
+    const zonePolicy = policies.find((policy) =>
+      policy.permission_groups.some((group) => group.id === 'pg-access-zone'),
+    )
+    expect(accountPolicy?.resources).toEqual({ 'com.cloudflare.api.account.acct-1': '*' })
+    expect(Object.keys(zonePolicy?.resources ?? {}).join()).toContain(
+      'com.cloudflare.api.account.zone',
+    )
+  })
+
+  test('a name that denotes nothing is still an error, not a silent omission', async () => {
+    const { error } = await runApply({
+      config: { permissions: ['No Such Permission'] },
+      state: { permissionGroups: DUAL_SCOPE_GROUPS },
+    })
+    expect(error?.message).toContain('No Such Permission')
+  })
+})
 
 describe('cloudflare-token apply — create path', () => {
   test('no existing token → POST with resolved permission-group ids + account resource', async () => {
@@ -200,7 +285,10 @@ describe('cloudflare-token apply — zone scoping', () => {
     const zoneLookups = byMethod(calls, 'GET', '/zones?name=cedarpad.com')
     expect(zoneLookups).toHaveLength(1)
     const body = byMethod(calls, 'POST', '/tokens')[0].body as {
-      policies: Array<{ permission_groups: Array<{ id: string }>; resources: Record<string, unknown> }>
+      policies: Array<{
+        permission_groups: Array<{ id: string }>
+        resources: Record<string, unknown>
+      }>
     }
     expect(body.policies).toHaveLength(2)
     const accountPolicy = body.policies.find((p) => p.permission_groups[0].id === 'pg-workers')
@@ -329,6 +417,8 @@ describe('deriveS3Credentials', () => {
     const { s3AccessKeyId, s3SecretAccessKey } = deriveS3Credentials('id-1', 'abc')
     expect(s3AccessKeyId).toBe('id-1')
     // sha256("abc")
-    expect(s3SecretAccessKey).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
+    expect(s3SecretAccessKey).toBe(
+      'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+    )
   })
 })

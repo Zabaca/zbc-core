@@ -40,12 +40,7 @@ interface CfEnvelope<T> {
 }
 
 /** Call the CF API; unwrap the envelope; throw the API's message on failure. */
-async function cf<T>(
-  rootToken: string,
-  method: string,
-  path: string,
-  body?: unknown,
-): Promise<T> {
+async function cf<T>(rootToken: string, method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${API}${path}`, {
     method,
     headers: {
@@ -99,7 +94,11 @@ export function buildPolicies(
     const resources: Record<string, unknown> =
       zoneIds.length > 0
         ? Object.fromEntries(zoneIds.map((id) => [`com.cloudflare.api.account.zone.${id}`, '*']))
-        : { [`com.cloudflare.api.account.${accountId}`]: { 'com.cloudflare.api.account.zone.*': '*' } }
+        : {
+            [`com.cloudflare.api.account.${accountId}`]: {
+              'com.cloudflare.api.account.zone.*': '*',
+            },
+          }
     policies.push({
       effect: 'allow',
       permission_groups: zoneScoped.map((g) => ({ id: g.id })),
@@ -179,14 +178,28 @@ export const cloudflareTokenModule = defineModule({
       'GET',
       `/accounts/${config.accountId}/tokens/permission_groups`,
     )
-    const groups = config.permissions.map((name) => {
-      const group = available.find((g) => g.name === name)
-      if (!group) {
+    // A permission NAME can denote more than one group. Cloudflare publishes
+    // several of them twice — "Access: Apps and Policies Write" exists both
+    // account-scoped and zone-scoped — and `find` silently took whichever came
+    // first in the API's ordering. That produced a token holding the permission
+    // at the WRONG resource level: granted on every zone, absent at the account,
+    // so `POST /accounts/{id}/access/apps` answered 403 while the dashboard
+    // showed the permission plainly present. Cost an apply to find.
+    //
+    // Every match is granted. `buildPolicies` already splits them by scope, so
+    // the account-scoped variant lands on the account policy and the zone-scoped
+    // one on the zone policy — which is exactly what picking that permission in
+    // the dashboard does. Naming a permission means naming it wherever it lives;
+    // there is no way for an instance to express "only the zone-scoped half",
+    // and no case yet where that distinction was the intent.
+    const groups = config.permissions.flatMap((name) => {
+      const matches = available.filter((g) => g.name === name)
+      if (matches.length === 0) {
         throw new Error(
           `Permission group "${name}" not found. Available: ${available.map((g) => g.name).join(', ')}`,
         )
       }
-      return group
+      return matches
     })
 
     // 2. Resolve zone names → ids (only when zone scoping is requested).
