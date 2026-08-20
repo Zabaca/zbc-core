@@ -866,6 +866,49 @@ function fakeIncus(options: FakeOptions = {}) {
 
 const APPLY_CTX = { secrets: {}, imports: {}, projectRoot: '/tmp' }
 
+// ── the seed is a create-time input, and is read only when creating ─────────
+//
+// `authorizedKeyFiles` names files on the machine running the apply, and the
+// cloud-init seed built from them is used on exactly one path: creating the
+// guest. Reading them for a guest that already exists makes every converge
+// depend on the operator's own `~/.ssh`, which is fine while one machine
+// converges and wrong the moment the Owner repo does it from anywhere
+// (ADR-0026 in the contributing repo).
+//
+// Found by applying an unchanged declaration from a second machine: the guest
+// was RUNNING and had been for days, and the apply died with
+// `ENOENT: ~/.ssh/authorized_keys` — a file the seed would not have been used
+// for even if it had existed.
+describe('a converge of an existing guest reads no key files', () => {
+  test('a missing authorizedKeyFiles path is not touched when the guest is there', async () => {
+    const daemon = fakeIncus({
+      guests: [{ name: 'already-here', status: 'Running', ipv4: '10.196.88.9' }],
+    })
+    const result = await applyVm(daemon, {
+      name: 'already-here',
+      authorizedKeys: [KEY_A],
+      authorizedKeyFiles: ['/definitely/not/a/path/authorized_keys'],
+    })
+    expect(result.created).toBe(false)
+    // And it really was the existing guest, not a silently created second one.
+    expect(daemon.mutations.some((c) => c.includes('init'))).toBe(false)
+  })
+
+  test('and the same missing path still fails when the guest must be created', async () => {
+    // The other direction, so this is not "stop reading key files": on the
+    // create path the seed is the only way a key reaches the guest, and a
+    // declaration naming a file that is not there is a broken declaration.
+    const daemon = fakeIncus({ guests: [] })
+    expect(
+      applyVm(daemon, {
+        name: 'brand-new',
+        authorizedKeys: [KEY_A],
+        authorizedKeyFiles: ['/definitely/not/a/path/authorized_keys'],
+      }),
+    ).rejects.toThrow(/ENOENT|no such file/i)
+  })
+})
+
 const applyVm = (daemon: { exec: Exec }, config: Record<string, unknown>) =>
   withExec(daemon.exec, () => vmModule.apply(vmModule.configSchema.parse(config), APPLY_CTX))
 

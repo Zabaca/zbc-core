@@ -535,19 +535,38 @@ export const vmModule = defineModule({
   apply: async (config) => {
     const daemon = daemonFor(config.target)
 
-    const keys = [
-      ...config.authorizedKeys,
-      ...config.authorizedKeyFiles.flatMap((f) =>
-        parseKeyFile(fs.readFileSync(expandHome(f), 'utf8')),
-      ),
-    ].filter((k) => k.length > 0)
-    const uniqueKeys = [...new Set(keys)]
-
-    const userData = renderCloudInit({
-      sshUser: config.sshUser,
-      authorizedKeys: uniqueKeys,
-      extraUserData: config.userData,
-    })
+    /**
+     * The cloud-init seed, built only when it is about to be used.
+     *
+     * `authorizedKeyFiles` names files on the machine running the apply, and
+     * the seed is a create-time input: cloud-init runs once, on first boot, and
+     * nothing on the converge path reads it. Building it eagerly made every
+     * converge of an existing guest depend on that machine's `~/.ssh`, which is
+     * invisible while one machine converges and breaks the moment the repo that
+     * owns a guest applies from somewhere else.
+     *
+     * Found by applying an unchanged declaration from a second machine: the
+     * guest had been RUNNING for days and the apply died with
+     * `ENOENT: ~/.ssh/authorized_keys`, on a file whose contents would have gone
+     * nowhere even if it had existed. A missing file on the CREATE path is still
+     * a broken declaration and still throws — that is the only path where a key
+     * reaches the guest at all.
+     */
+    const seed = (): string =>
+      renderCloudInit({
+        sshUser: config.sshUser,
+        authorizedKeys: [
+          ...new Set(
+            [
+              ...config.authorizedKeys,
+              ...config.authorizedKeyFiles.flatMap((f) =>
+                parseKeyFile(fs.readFileSync(expandHome(f), 'utf8')),
+              ),
+            ].filter((k) => k.length > 0),
+          ),
+        ],
+        extraUserData: config.userData,
+      })
 
     const desired = buildDesiredConfig(config)
 
@@ -598,7 +617,7 @@ export const vmModule = defineModule({
       // Not `renderConfigPair`, which single-quotes the whole pair: that is
       // right for every other value here and would stop this one substituting.
       const tmp = path.join(os.tmpdir(), `foundry-cloud-init-${config.name}.yaml`)
-      fs.writeFileSync(tmp, userData, { mode: 0o600 })
+      fs.writeFileSync(tmp, seed(), { mode: 0o600 })
       try {
         daemon.run(`config set ${daemon.ref(config.name)} cloud-init.user-data="$(cat ${tmp})"`)
       } finally {
