@@ -1,0 +1,14 @@
+{
+  "name": "cloudflare-zone",
+  "description": "A DNS zone's records, authoritative but delete-gated — the repo says what exists, and removing one is a decision a human takes",
+  "files": [
+    {
+      "path": "index.ts"
+    }
+  ],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": [],
+  "instructions": "Reads the Cloudflare API through `../cloudflare-api`; needs a token with DNS write on the zone. Authoritative over the record types it declares: a record present in Cloudflare and absent here is reported, and deleting it takes an explicit opt-in, because a zone is the one place where converging by deletion can take a domain off the internet between two applies. In COPY mode run `zbc add cloudflare-api` too."
+}

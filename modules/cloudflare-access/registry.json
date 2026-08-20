@@ -1,0 +1,14 @@
+{
+  "name": "cloudflare-access",
+  "description": "A Zero Trust application, its policy, and the service token a machine caller presents — the gate that lands with the tunnel it guards",
+  "files": [
+    {
+      "path": "index.ts"
+    }
+  ],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": [],
+  "instructions": "Reads the Cloudflare API through `../cloudflare-api`; needs an API token with Access: Apps and Policies write on the account. Declare it beside the tunnel that exposes the hostname: a hostname on the internet with no policy in front of it is an open door, which is the failure this module exists to make hard to reach. The service token's secret is an output — put it somewhere a caller can read it, not in the declaration. In COPY mode run `zbc add cloudflare-api` too."
+}

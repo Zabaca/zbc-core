@@ -1,0 +1,12 @@
+{
+  "name": "cloudflare-api",
+  "description": "The Cloudflare API root, its response envelope, and the one rule for reading a credential — so the modules that call it do not each carry a copy that drifts",
+  "files": [
+    {
+      "path": "index.ts"
+    }
+  ],
+  "dependencies": {},
+  "secrets": [],
+  "instructions": "Not a module: it exports no defineModule. It is the library `cloudflare-access`, `cloudflare-tunnel` and `cloudflare-zone` import as `../cloudflare-api`. It exists because the same envelope-unwrapping had reached four copies in the contributing repo before anybody counted — `success`, `errors`, `result` is not hard, and that is exactly why it gets rewritten slightly differently every time. In COPY mode add it alongside whichever Cloudflare module you copied."
+}
