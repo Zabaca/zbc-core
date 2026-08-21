@@ -1,11 +1,3 @@
-// Contributed from foundry, 2026-08-18 — the second group of host-converging
-// modules to arrive that way, after systemd-unit / host-file /
-// docker-compose-stack on 2026-08-03.
-//
-// The comments below cite `ADR-NNNN` and sibling test files by bare name. Those
-// are **foundry's**, not this repository's, and they are kept rather than
-// stripped because each one is the record of a failure that shaped the code —
-// a reference a reader can go and find beats a rationale nobody can check.
 import { existsSync, lstatSync, mkdirSync, readlinkSync, rmSync, symlinkSync } from 'node:fs'
 import { dirname, isAbsolute } from 'node:path'
 import { z } from 'zod'
@@ -96,7 +88,7 @@ export const hostSymlinkModule = defineModule({
     target: z.string().refine(isAbsolute, 'a symlink target must be absolute'),
   }),
   outputs: z.object({ path: z.string(), target: z.string(), changed: z.boolean() }),
-  // No `destroy`, matching `systemd-mask` and `tailscale-serve`. Removing one
+  // No `destroy`, matching `systemd-mask`. Removing one
   // is `rm <path>` plus deleting the instance file, deliberately by hand: the
   // engine prunes nothing, so a teardown here would be a code path nothing
   // exercises until the day it matters.
@@ -114,7 +106,7 @@ export const hostSymlinkModule = defineModule({
     rmSync(config.path, { force: true })
     symlinkSync(config.target, config.path)
 
-    // Read it back rather than trust the call. Same reason `tailscale-serve`
+    // Read it back rather than trust the call. Same reason the other converging
     // re-reads: this is the step whose result nothing else in the apply checks.
     const after = linkPlan(config.path, config.target)
     if (after.action !== 'noop') {

@@ -1,11 +1,3 @@
-// Contributed from foundry, 2026-08-18 — the second group of host-converging
-// modules to arrive that way, after systemd-unit / host-file /
-// docker-compose-stack on 2026-08-03.
-//
-// The comments below cite `ADR-NNNN` and sibling test files by bare name. Those
-// are **foundry's**, not this repository's, and they are kept rather than
-// stripped because each one is the record of a failure that shaped the code —
-// a reference a reader can go and find beats a rationale nobody can check.
 import { execFileSync } from 'node:child_process'
 import { lstatSync, mkdirSync, readlinkSync, rmSync, symlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -112,7 +104,7 @@ export const systemdMaskModule = defineModule({
   }),
   outputs: z.object({ unit: z.string(), path: z.string(), changed: z.boolean() }),
   // No `destroy`. Unmasking is `systemctl --user unmask <unit>` and is a
-  // deliberate two-step, like tailscale-serve's absent teardown: delete the
+  // deliberate two-step, like the other modules' absent teardown: delete the
   // instance file and run the command. An automated unmask would re-arm a unit
   // that was masked for a reason nobody is re-reading at that moment.
   apply: async (config) => {

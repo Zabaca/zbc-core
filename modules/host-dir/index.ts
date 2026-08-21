@@ -1,11 +1,3 @@
-// Contributed from foundry, 2026-08-18 — the second group of host-converging
-// modules to arrive that way, after systemd-unit / host-file /
-// docker-compose-stack on 2026-08-03.
-//
-// The comments below cite `ADR-NNNN` and sibling test files by bare name. Those
-// are **foundry's**, not this repository's, and they are kept rather than
-// stripped because each one is the record of a failure that shaped the code —
-// a reference a reader can go and find beats a rationale nobody can check.
 import { chmodSync, lstatSync, mkdirSync, statSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
 import { z } from 'zod'
@@ -15,39 +7,39 @@ import { exec } from '../host-exec'
 // host-dir — a directory that exists because this repo says so.
 //
 // **Why the existing modules are all the wrong one.** Every module here that
-// creates a directory creates a *specific kind* of thing: `git-worktree` a
-// worktree, `incus-storage-pool` a pool. `host-file` comes closest and is the
+// creates a directory creates a *specific kind* of thing —
+// `incus-storage-pool` creates a pool, not a directory you asked for. `host-file` comes closest and is the
 // dangerous near-miss — it calls `mkdirSync(dirname(config.path))` only on the
 // way to writing file **contents**, so declaring a database's directory through
 // it would make every apply overwrite the database. That is worse than no
 // declaration at all.
 //
-// **What it is for.** ADR-0025 puts the Ticket store outside the git tree at a
+// **What it is for.** An application's data store lives outside the git tree at a
 // declared path. A directory that exists because some program's `mkdir -p` ran
 // first is hand-configured state: it survives a reboot, nothing in this tree
 // declares it, and a rebuilt box comes back without it. The rows in the
 // database are work state and are not machine configuration; the directory,
 // its mode and its owner are.
 //
-// **No `destroy`, on `apt-packages`' reasoning** — removing something stays a
+// **No `destroy`** — removing something stays a
 // human act — and sharper here than there. `apt-get remove` takes reverse
 // dependencies with it; removing this directory deletes the only copy of the
-// Ticket store. A teardown path would be code nothing exercises until the day
+// store. A teardown path would be code nothing exercises until the day
 // it matters, and on that day it deletes the thing it was written to manage.
 //
 // **Contents are not managed.** The mode and owner converged here are the
 // directory's own, never its tree's. That is not a simplification: on this box
-// `~/.local/share/foundry/` already holds 1.4 GB of `claude-sessions/` written
-// by `services/claude-sync`, so a recursive converge would rewrite every one of
+// A data directory can already hold gigabytes of state written
+// by the application that owns it, so a recursive converge would rewrite every one of
 // those modes as a side effect of declaring the directory above them.
 //
 // **Two seams, because the machine has two shapes here.** Creating a directory
 // and setting its mode are filesystem calls against the absolute path the
 // config names, and a filesystem has temp directories — so those run for real
-// in tests, the way `host-symlink` and `claude-settings` do. Ownership is the
+// in tests, the way `host-symlink` does. Ownership is the
 // half a test cannot duplicate: a non-root process cannot chown to another
 // user, so there is no temp-directory equivalent. That half goes through
-// `host-exec` and is substituted instead (ADR-0023).
+// `host-exec` and is substituted instead.
 
 export type DirPlan =
   | { action: 'noop' }
@@ -123,8 +115,8 @@ export const renderOwnerQuery = (path: string): string => `stat -c '%U:%G' ${pat
 /**
  * Take ownership of the path.
  *
- * Through `sudo`, matching the vm, systemd-unit, incus-storage-pool and
- * apt-packages convention on this host (passwordless sudo is set up
+ * Through `sudo`, matching the vm, systemd-unit and incus-storage-pool
+ * convention on this host (passwordless sudo is set up
  * deliberately). Without it the one state a chown exists to fix — a directory
  * left owned by root, by a `mkdir` under sudo or by a restore — is the one
  * state it cannot fix.
@@ -143,9 +135,8 @@ export const hostDirModule = defineModule({
       // untouched.
       .refine(isAbsolute, 'a directory path must be absolute')
       // Interpolated into `stat` and `chown`, so anything outside this set is
-      // an injection seam rather than a typo — the reason `apt-packages`
-      // regex-validates package names and `tailscale-serve` refuses
-      // metacharacters in a target.
+      // an injection seam rather than a typo — the same reason every module
+      // here that interpolates config into a command validates it first.
       .refine(
         (path) => /^[A-Za-z0-9/._-]+$/.test(path),
         'a directory path is interpolated into a shell command, so it may hold only [A-Za-z0-9/._-] — refusing shell characters',
@@ -166,8 +157,8 @@ export const hostDirModule = defineModule({
     owner: z.string(),
     changed: z.boolean(),
   }),
-  // No `destroy`, matching `host-symlink`, `systemd-mask` and `tailscale-serve`.
-  // See the header: here it would delete the only copy of the Ticket store.
+  // No `destroy`, matching `host-symlink` and `systemd-mask`.
+  // See the header: here it would delete the only copy of the store.
   apply: async (config) => {
     const plan = dirPlan(config.path, config.mode)
     const mode = parseInt(config.mode, 8)
@@ -180,8 +171,8 @@ export const hostDirModule = defineModule({
     // for the same reason.
     if (plan.action !== 'noop') chmodSync(config.path, mode)
 
-    // Read it back rather than trust the calls. Same reason `host-symlink` and
-    // `tailscale-serve` re-read: this is the step whose result nothing else in
+    // Read it back rather than trust the calls. Same reason `host-symlink`
+    // re-reads: this is the step whose result nothing else in
     // the apply checks.
     const after = dirPlan(config.path, config.mode)
     if (after.action !== 'noop') {

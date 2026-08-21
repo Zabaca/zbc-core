@@ -21,12 +21,10 @@ import { hostSymlinkModule, linkPlan } from './index'
 
 // A fixture root this file owns and removes.
 //
-// Contributed from foundry, where the same call shape (`tmpFixture`) is backed
-// by a cross-run reaper the suite runner invokes — a design that exists because
-// `process.on('exit')` never fires under `bun test`, so ~50 files' `mkdtempSync`
-// calls had leaked 24 GB into /tmp. Core's `bun test` has no runner to hang a
-// reap off, so the discipline lands per file instead: one root, `afterAll`
-// removes it, and every call site below is unchanged.
+// One root per file, removed in `afterAll`, rather than a `mkdtempSync` per
+// test. `process.on('exit')` never fires under `bun test`, so per-test temp
+// directories are never reaped — roughly 50 files doing it that way had leaked
+// 24 GB into /tmp before the discipline landed.
 const ROOT = mkdtempSync(join(tmpdir(), 'host-symlink-'))
 afterAll(() => rmSync(ROOT, { recursive: true, force: true }))
 
@@ -90,7 +88,7 @@ describe('what the plan does with each state on disk', () => {
 // The failure mode a symlink has and a copied file does not.
 describe('a link to a target that is not there', () => {
   test('is refused before it is made', () => {
-    // A dangling link is worse than no link: `~/.claude/agents/foundry.md`
+    // A dangling link is worse than no link: `~/.claude/agents/notes.md`
     // exists, `ls` shows it, and the agent is simply absent from every session
     // with nothing anywhere saying why.
     const base = dir()
@@ -121,10 +119,10 @@ describe('what a declaration has to look like', () => {
 
   test('an absolute path and an absolute target are accepted', () => {
     const parsed = parse({
-      path: '/home/uptown/.claude/agents/x.md',
-      target: '/home/uptown/foundry/docs/agents/x.md',
+      path: '/home/deploy/.claude/agents/x.md',
+      target: '/home/deploy/repo/docs/agents/x.md',
     })
-    expect(parsed.path).toBe('/home/uptown/.claude/agents/x.md')
+    expect(parsed.path).toBe('/home/deploy/.claude/agents/x.md')
   })
 
   test('a relative path is refused', () => {
@@ -132,9 +130,9 @@ describe('what a declaration has to look like', () => {
     // and an apply that writes a link into a worktree instead of `$HOME` is a
     // silent success — the same shape `systemd-mask` refuses for a relative
     // home.
-    expect(() =>
-      parse({ path: '.claude/agents/x.md', target: '/home/uptown/foundry/x.md' }),
-    ).toThrow(/absolute/i)
+    expect(() => parse({ path: '.claude/agents/x.md', target: '/home/deploy/repo/x.md' })).toThrow(
+      /absolute/i,
+    )
   })
 
   test('a relative target is refused, because a link stores it verbatim', () => {
@@ -142,7 +140,7 @@ describe('what a declaration has to look like', () => {
     // cwd of the apply that wrote it. That is a second rule to hold in your
     // head for no gain here.
     expect(() =>
-      parse({ path: '/home/uptown/.claude/agents/x.md', target: '../foundry/x.md' }),
+      parse({ path: '/home/deploy/.claude/agents/x.md', target: '../repo/x.md' }),
     ).toThrow(/absolute/i)
   })
 })
@@ -167,7 +165,7 @@ describe('the apply writes the link, and not only a plan of one', () => {
     // Nested on purpose. `mkdirSync(dirname(path), { recursive: true })` is a
     // step of the apply that no test above reaches, and `~/.claude/agents/` not
     // existing yet is exactly the state a rebuilt box starts in.
-    const path = join(base, 'agents', 'foundry.md')
+    const path = join(base, 'agents', 'notes.md')
 
     const result = await apply(path, target)
 

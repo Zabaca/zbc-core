@@ -1,12 +1,3 @@
-// Contributed from foundry, 2026-08-19 — the third group to arrive that way,
-// after systemd-unit / host-file / docker-compose-stack on 2026-08-03 and the
-// four host primitives on 2026-08-18.
-//
-// The comments below cite `ADR-NNNN` and sibling test files by bare name. Those
-// are **foundry's**, not this repository's, and they are kept rather than
-// stripped because each one is the record of a failure that shaped the code —
-// a reference a reader can go and find beats a rationale nobody can check.
-
 import { describe, expect, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { type Exec, withExec } from '../host-exec'
@@ -47,7 +38,7 @@ describe('provisionDigest', () => {
 })
 
 describe('resolveInstanceName', () => {
-  const vmOutputs = { name: 'agent-vm', type: 'container', sshUser: 'foundry', ipv4: '10.0.0.2' }
+  const vmOutputs = { name: 'agent-vm', type: 'container', sshUser: 'deploy', ipv4: '10.0.0.2' }
 
   test('prefers an explicit config value', () => {
     expect(resolveInstanceName('explicit', { 'agent-vm': vmOutputs })).toBe('explicit')
@@ -207,7 +198,7 @@ describe('resolveVolatileEnv', () => {
 // Everything above tests pure functions — the digest, the script text, how an
 // instance name is resolved. None of it runs `apply`, and gutting `apply` to
 // `return { instance: 'x', digest: 'y', changed: false }` left the whole suite
-// green until this file was extended. See ADR-0023.
+// green until this file was extended.
 
 describe('the machine is reached through the seam', () => {
   const source = fs.readFileSync(`${import.meta.dir}/index.ts`, 'utf8')
@@ -224,7 +215,7 @@ describe('the machine is reached through the seam', () => {
 
 // ── An in-memory guest ──────────────────────────────────────────────────────
 //
-// A machine, not a call recorder (ADR-0023). The whole of this module's effect
+// A machine, not a call recorder. The whole of this module's effect
 // is one script delivered on stdin, so the fake *executes* that script: it
 // exports the variables, installs the packages, and writes the marker the
 // script itself ends with. That last part is what makes the second apply
@@ -255,7 +246,7 @@ const unquote = (value: string): string =>
 
 interface FakeGuest {
   running: boolean
-  /** `/var/lib/foundry-provision/<marker>` → digest. */
+  /** `/var/lib/zbc-provision/<marker>` → digest. */
   markers: Record<string, string>
   /** What the last run exported, as the guest's environment saw it. */
   env: Record<string, string>
@@ -364,11 +355,11 @@ function fakeGuest(instance: string, options: FakeOptions = {}) {
   }
 }
 
-const VM_OUTPUTS = { name: 'agent-vm', type: 'container', sshUser: 'foundry', ipv4: '10.0.0.2' }
+const VM_OUTPUTS = { name: 'agent-vm', type: 'container', sshUser: 'deploy', ipv4: '10.0.0.2' }
 
 /** Everything the vm module reports for a guest it converged on a remote. */
-const REMOTE: IncusTarget = { remote: 'ryzen-9', project: 'zabaca' }
-const REMOTE_VM_OUTPUTS = { ...VM_OUTPUTS, name: 'cedarpad-ws', target: REMOTE }
+const REMOTE: IncusTarget = { remote: 'build-host', project: 'zabaca' }
+const REMOTE_VM_OUTPUTS = { ...VM_OUTPUTS, name: 'dev-ws', target: REMOTE }
 
 const applyProvision = (
   daemon: { exec: Exec },
@@ -408,8 +399,8 @@ describe('the apply provisions the guest, and not only a digest of one', () => {
 
     await applyProvision(daemon, { script: 'whoami' })
 
-    expect(daemon.guest.env.PROVISION_USER).toBe('foundry')
-    expect(daemon.guest.env.PROVISION_HOME).toBe('/home/foundry')
+    expect(daemon.guest.env.PROVISION_USER).toBe('deploy')
+    expect(daemon.guest.env.PROVISION_HOME).toBe('/home/deploy')
   })
 
   test('with no vm to ask, it runs as root rather than guessing a user', async () => {
@@ -579,13 +570,13 @@ describe('the apply refuses to report success it did not have', () => {
     // payload at all also throws and also leaves the marker alone, and this was
     // measured — the mutation that drops `input` from the call site survived
     // every other assertion here.
-    expect(daemon.guest.env.PROVISION_USER).toBe('foundry')
+    expect(daemon.guest.env.PROVISION_USER).toBe('deploy')
   })
 })
 
 // ── Absent means local, and "local" is these exact bytes ────────────────────
 //
-// The other half of `remote-guests/02`'s safety property, in the module that
+// The other half of the `target` safety property, in the module that
 // inherits the target rather than declaring it. Written and made to pass
 // against this module as it stood at `bbc2094`, before `target` existed
 // anywhere, so it records what the command line was rather than restating what
@@ -598,7 +589,7 @@ describe('a declaration whose vm names no target renders exactly what it rendere
     await applyProvision(daemon, { packages: ['git'], script: 'install-the-toolchain' })
 
     expect(daemon.commands).toEqual([
-      "sudo incus exec agent-vm -- sh -c 'cat /var/lib/foundry-provision/default 2>/dev/null || true'",
+      "sudo incus exec agent-vm -- sh -c 'cat /var/lib/zbc-provision/default 2>/dev/null || true'",
       'sudo incus exec agent-vm -- bash -s',
     ])
   })
@@ -606,7 +597,7 @@ describe('a declaration whose vm names no target renders exactly what it rendere
 
 // ── The target is inherited, never re-declared ─────────────────────────────
 //
-// `remote-guests/02`, in the module that does not own the declaration. A Guest
+// The `target` property, in the module that does not own the declaration. A Guest
 // states its endpoint once, on its vm, and this module reads it off the imported
 // outputs exactly as it already reads `sshUser`. Two declarations of the same
 // endpoint could disagree, and the one that disagreed would provision a guest on
@@ -614,29 +605,29 @@ describe('a declaration whose vm names no target renders exactly what it rendere
 
 describe('a guest declared on a remote is provisioned on that remote', () => {
   test('both commands of a full provision, byte for byte', async () => {
-    const daemon = fakeGuest('cedarpad-ws', { endpoint: REMOTE })
+    const daemon = fakeGuest('dev-ws', { endpoint: REMOTE })
 
     await applyProvision(
       daemon,
       { packages: ['git'], script: 'install-the-toolchain' },
-      { imports: { 'cedarpad-ws': REMOTE_VM_OUTPUTS } },
+      { imports: { 'dev-ws': REMOTE_VM_OUTPUTS } },
     )
 
     // Against the local list above: no `sudo`, `--project zabaca` before the
-    // subcommand, and the guest carrying `ryzen-9:`.
+    // subcommand, and the guest carrying `build-host:`.
     expect(daemon.commands).toEqual([
-      "incus --project zabaca exec ryzen-9:cedarpad-ws -- sh -c 'cat /var/lib/foundry-provision/default 2>/dev/null || true'",
-      'incus --project zabaca exec ryzen-9:cedarpad-ws -- bash -s',
+      "incus --project zabaca exec build-host:dev-ws -- sh -c 'cat /var/lib/zbc-provision/default 2>/dev/null || true'",
+      'incus --project zabaca exec build-host:dev-ws -- bash -s',
     ])
   })
 
   test('the payload really reaches the guest — the strings alone prove nothing', async () => {
-    const daemon = fakeGuest('cedarpad-ws', { endpoint: REMOTE })
+    const daemon = fakeGuest('dev-ws', { endpoint: REMOTE })
 
     const result = await applyProvision(
       daemon,
       { packages: ['jq'], script: 'install-the-toolchain', env: { NODE_VERSION: '22' } },
-      { imports: { 'cedarpad-ws': REMOTE_VM_OUTPUTS } },
+      { imports: { 'dev-ws': REMOTE_VM_OUTPUTS } },
     )
 
     expect([...daemon.guest.installed]).toEqual(['jq'])
@@ -646,9 +637,9 @@ describe('a guest declared on a remote is provisioned on that remote', () => {
   })
 
   test('a second apply against the remote is a no-op, having first provisioned', async () => {
-    const daemon = fakeGuest('cedarpad-ws', { endpoint: REMOTE })
+    const daemon = fakeGuest('dev-ws', { endpoint: REMOTE })
     const declaration = { packages: ['git'], script: 'install-the-toolchain' }
-    const imports = { imports: { 'cedarpad-ws': REMOTE_VM_OUTPUTS } }
+    const imports = { imports: { 'dev-ws': REMOTE_VM_OUTPUTS } }
 
     const first = await applyProvision(daemon, declaration, imports)
     expect(first.changed).toBe(true)
@@ -664,12 +655,12 @@ describe('a guest declared on a remote is provisioned on that remote', () => {
     // Stated once per Guest. `target` is not in this module's schema, so zod
     // drops it — and this pins that the drop is the behaviour rather than an
     // accident waiting to be "fixed" into a field that overrides the vm.
-    const daemon = fakeGuest('cedarpad-ws', { endpoint: REMOTE })
+    const daemon = fakeGuest('dev-ws', { endpoint: REMOTE })
 
     await applyProvision(
       daemon,
       { script: 'x', target: { remote: 'somewhere-else', project: 'wrong' } },
-      { imports: { 'cedarpad-ws': REMOTE_VM_OUTPUTS } },
+      { imports: { 'dev-ws': REMOTE_VM_OUTPUTS } },
     )
 
     expect(daemon.provisions).toHaveLength(1)
@@ -690,18 +681,18 @@ describe('a guest declared on a remote is provisioned on that remote', () => {
 
 describe('the addressed fake would notice — controls for the tests above', () => {
   test('a local guest refuses the remote form', async () => {
-    const daemon = fakeGuest('cedarpad-ws')
+    const daemon = fakeGuest('dev-ws')
 
     await expect(
-      applyProvision(daemon, { script: 'x' }, { imports: { 'cedarpad-ws': REMOTE_VM_OUTPUTS } }),
-    ).rejects.toThrow(/reached as `sudo incus exec cedarpad-ws`/)
+      applyProvision(daemon, { script: 'x' }, { imports: { 'dev-ws': REMOTE_VM_OUTPUTS } }),
+    ).rejects.toThrow(/reached as `sudo incus exec dev-ws`/)
   })
 
   test('a remote guest refuses the local form', async () => {
     const daemon = fakeGuest('agent-vm', { endpoint: REMOTE })
 
     await expect(applyProvision(daemon, { script: 'x' })).rejects.toThrow(
-      /reached as `incus --project zabaca exec ryzen-9:agent-vm`/,
+      /reached as `incus --project zabaca exec build-host:agent-vm`/,
     )
   })
 })
@@ -714,6 +705,6 @@ describe('findVmOutputs', () => {
   })
 
   test('and carries the target through when there is one', async () => {
-    expect(findVmOutputs({ 'cedarpad-ws': REMOTE_VM_OUTPUTS })[0]?.target).toEqual(REMOTE)
+    expect(findVmOutputs({ 'dev-ws': REMOTE_VM_OUTPUTS })[0]?.target).toEqual(REMOTE)
   })
 })

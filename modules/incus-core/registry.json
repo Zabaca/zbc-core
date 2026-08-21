@@ -1,6 +1,6 @@
 {
   "name": "incus-core",
-  "description": "The `sudo incus` invocation and the JSON read every incus-touching module shares — one place where the decision to reach the daemon as root lives, plus the transcript of `incus config set --help` two renderers are anchored to",
+  "description": "The `sudo incus` invocation and the JSON read every incus-touching module shares \u2014 one place where the decision to reach the daemon as root lives, plus the transcript of `incus config set --help` two renderers are anchored to",
   "files": [
     {
       "path": "index.ts"
@@ -16,5 +16,5 @@
     "zod": "^3.24.0"
   },
   "secrets": [],
-  "instructions": "Not a module: it exports no defineModule and declares no instance. It is the library `vm`, `vm-provision` and (in the contributing repo) `incus-listener`, `incus-project` and `incus-trust` import as `../incus-core`, and it reaches the machine through `../host-exec`. `config-set-help.ts` and the `.txt` beside it are test support: `incus config set --help` captured verbatim from incus 6.0.0, so a module's rendered argv can be checked against the binary rather than against a literal a renderer's author wrote. In vendor mode the sibling imports resolve with nothing to install; in COPY mode run `zbc add host-exec` as well."
+  "instructions": "Not a module: it exports no defineModule and declares no instance. It is the library `vm`, `vm-provision` and any other daemon-facing module import as `../incus-core`, and it reaches the machine through `../host-exec`. `config-set-help.ts` and the `.txt` beside it are test support: `incus config set --help` captured verbatim from incus 6.0.0, so a module's rendered argv can be checked against the binary rather than against a literal a renderer's author wrote. In vendor mode the sibling imports resolve with nothing to install; in COPY mode run `zbc add host-exec` as well."
 }

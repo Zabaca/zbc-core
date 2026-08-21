@@ -1,12 +1,3 @@
-// Contributed from foundry, 2026-08-19 — the third group to arrive that way,
-// after systemd-unit / host-file / docker-compose-stack on 2026-08-03 and the
-// four host primitives on 2026-08-18.
-//
-// The comments below cite `ADR-NNNN` and sibling test files by bare name. Those
-// are **foundry's**, not this repository's, and they are kept rather than
-// stripped because each one is the record of a failure that shaped the code —
-// a reference a reader can go and find beats a rationale nobody can check.
-
 import { describe, expect, test } from 'bun:test'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
@@ -36,25 +27,25 @@ import {
 } from './index'
 
 const KEY_A = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyA james@mac'
-const KEY_B = 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABExampleKeyB foundry@ryzen-9'
+const KEY_B = 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABExampleKeyB deploy@build-host'
 
 const parse = (s: string) => Bun.YAML.parse(s) as Record<string, any>
 
 describe('renderCloudInit', () => {
   test('leads with the #cloud-config header cloud-init requires', () => {
-    const out = renderCloudInit({ sshUser: 'foundry', authorizedKeys: [KEY_A] })
+    const out = renderCloudInit({ sshUser: 'deploy', authorizedKeys: [KEY_A] })
     expect(out.split('\n')[0]).toBe('#cloud-config')
   })
 
   test('injects every authorized key onto the ssh user', () => {
-    const parsed = parse(renderCloudInit({ sshUser: 'foundry', authorizedKeys: [KEY_A, KEY_B] }))
+    const parsed = parse(renderCloudInit({ sshUser: 'deploy', authorizedKeys: [KEY_A, KEY_B] }))
     expect(parsed.users).toHaveLength(1)
-    expect(parsed.users[0].name).toBe('foundry')
+    expect(parsed.users[0].name).toBe('deploy')
     expect(parsed.users[0].ssh_authorized_keys).toEqual([KEY_A, KEY_B])
   })
 
   test('grants the ssh user passwordless sudo', () => {
-    const parsed = parse(renderCloudInit({ sshUser: 'foundry', authorizedKeys: [KEY_A] }))
+    const parsed = parse(renderCloudInit({ sshUser: 'deploy', authorizedKeys: [KEY_A] }))
     expect(parsed.users[0].sudo).toContain('NOPASSWD')
   })
 
@@ -66,12 +57,12 @@ describe('renderCloudInit', () => {
     // `UsePAM no`, under which sshd refuses any account whose shadow field is
     // `!`. That is exactly what cloud-init's own password locking produces, so
     // the guest ends up unreachable. Use a drop-in instead.
-    const parsed = parse(renderCloudInit({ sshUser: 'foundry', authorizedKeys: [KEY_A] }))
+    const parsed = parse(renderCloudInit({ sshUser: 'deploy', authorizedKeys: [KEY_A] }))
     expect(parsed.ssh_pwauth).toBeUndefined()
   })
 
   test('disables password auth through an sshd drop-in that keeps PAM on', () => {
-    const parsed = parse(renderCloudInit({ sshUser: 'foundry', authorizedKeys: [KEY_A] }))
+    const parsed = parse(renderCloudInit({ sshUser: 'deploy', authorizedKeys: [KEY_A] }))
     const dropIn = parsed.write_files.find((f: { path: string }) =>
       f.path.startsWith('/etc/ssh/sshd_config.d/'),
     )
@@ -81,7 +72,7 @@ describe('renderCloudInit', () => {
   })
 
   test('guarantees the drop-in is actually read, then restarts sshd', () => {
-    const parsed = parse(renderCloudInit({ sshUser: 'foundry', authorizedKeys: [KEY_A] }))
+    const parsed = parse(renderCloudInit({ sshUser: 'deploy', authorizedKeys: [KEY_A] }))
     const runcmd = JSON.stringify(parsed.runcmd)
     expect(runcmd).toContain('Include /etc/ssh/sshd_config.d/')
     expect(runcmd).toContain('restart')
@@ -90,7 +81,7 @@ describe('renderCloudInit', () => {
   test('merges extraUserData, concatenating array keys rather than clobbering', () => {
     const parsed = parse(
       renderCloudInit({
-        sshUser: 'foundry',
+        sshUser: 'deploy',
         authorizedKeys: [KEY_A],
         extraUserData: 'packages:\n  - htop\n',
       }),
@@ -102,7 +93,7 @@ describe('renderCloudInit', () => {
   test('lets extraUserData override a scalar key outright', () => {
     const parsed = parse(
       renderCloudInit({
-        sshUser: 'foundry',
+        sshUser: 'deploy',
         authorizedKeys: [KEY_A],
         extraUserData: 'package_update: false\n',
       }),
@@ -111,19 +102,19 @@ describe('renderCloudInit', () => {
   })
 
   test('emits block-style yaml, so the seed is readable when debugging in the guest', () => {
-    const out = renderCloudInit({ sshUser: 'foundry', authorizedKeys: [KEY_A] })
+    const out = renderCloudInit({ sshUser: 'deploy', authorizedKeys: [KEY_A] })
     expect(out).toContain('\nusers:')
     expect(out).not.toContain('{users:')
   })
 
   test('survives a key comment containing a comma', () => {
     const tricky = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyC james, personal laptop'
-    const parsed = parse(renderCloudInit({ sshUser: 'foundry', authorizedKeys: [tricky] }))
+    const parsed = parse(renderCloudInit({ sshUser: 'deploy', authorizedKeys: [tricky] }))
     expect(parsed.users[0].ssh_authorized_keys).toEqual([tricky])
   })
 
   test('rejects an empty key set — a VM with no keys is unreachable', () => {
-    expect(() => renderCloudInit({ sshUser: 'foundry', authorizedKeys: [] })).toThrow()
+    expect(() => renderCloudInit({ sshUser: 'deploy', authorizedKeys: [] })).toThrow()
   })
 })
 
@@ -249,17 +240,17 @@ describe('renderRootSizeArgs', () => {
   test('a remote guest is named to the remote, in either branch', () => {
     // The verb is about where the root device came from; the name is about
     // which daemon holds it. Neither decides the other.
-    expect(renderRootSizeArgs({ name: 'ws', disk: '40GiB', target: { remote: 'ryzen-9' } })).toBe(
-      'config device override ryzen-9:ws root size=40GiB',
-    )
+    expect(
+      renderRootSizeArgs({ name: 'ws', disk: '40GiB', target: { remote: 'build-host' } }),
+    ).toBe('config device override build-host:ws root size=40GiB')
     expect(
       renderRootSizeArgs({
         name: 'ws',
         disk: '40GiB',
         storagePool: 'sessions',
-        target: { remote: 'ryzen-9' },
+        target: { remote: 'build-host' },
       }),
-    ).toBe('config device set ryzen-9:ws root size=40GiB')
+    ).toBe('config device set build-host:ws root size=40GiB')
   })
 })
 
@@ -375,7 +366,7 @@ describe('pickIpv4', () => {
 // of it runs `apply`, and until this file was extended nothing in the suite did:
 // gutting `apply` to `return { name: config.name, type: config.type, sshUser:
 // config.sshUser, ipv4: null, created: false, changed: false }` left the whole
-// suite green. That is the audit finding ADR-0023 was written for, and the
+// suite green. That is the audit finding this seam was built for, and the
 // module could not be fixed the way `host-symlink`'s was — there is one incus
 // daemon on this box and a test that ran the real thing would create guests.
 
@@ -400,12 +391,12 @@ describe('the machine is reached through the seam', () => {
 // ── The argv incus documents, read out of the binary ────────────────────────
 //
 // `incus-core/incus-config-set.help.txt` is `incus config set --help` captured
-// verbatim from incus 6.0.0 on ryzen-9 on 2026-08-18: stdout, exit 0, no daemon
+// verbatim from incus 6.0.0 on build-host on 2026-08-18: stdout, exit 0, no daemon
 // and no sudo, and byte-identical at `COLUMNS=40`, at `COLUMNS=200` and through
 // a pipe, so it is a transcript rather than a rendering of this terminal. It
-// moved next to the parsers it anchors in `remote-guests/19`, when
-// `incus-listener` became the second module asking the binary the same
-// question — one transcript, so two renderers cannot drift from it separately.
+// It sits next to the parsers it anchors, so that when a second module asks
+// the binary the same question there is one transcript and two renderers
+// cannot drift from it separately.
 //
 // It is here because this repo has already shipped a module and its fake wrong
 // **together**. `incus config trust list-tokens` marshals an untagged Go struct
@@ -432,7 +423,7 @@ const CONFIG_SET_HELP = readConfigSetHelp()
  * What incus does with the config arguments of a `config set`, i.e. everything
  * after the instance reference.
  *
- * Measured on ryzen-9, incus 6.0.0, 2026-08-18, against an instance that does
+ * Measured on build-host, incus 6.0.0, 2026-08-18, against an instance that does
  * not exist — so every probe below failed and none of them changed anything.
  * The point of using a missing instance is that the two failures are
  * *distinguishable*: `Invalid key=value configuration` is raised while parsing
@@ -479,7 +470,7 @@ export function readConfigArgs(args: string[]): { key: string; value: string }[]
 
 // ── An in-memory incus ──────────────────────────────────────────────────────
 //
-// A machine, not a call recorder (ADR-0023). It answers `incus list --format
+// A machine, not a call recorder. It answers `incus list --format
 // json` from its own state and it *mutates* that state on `init`, `start`,
 // `config set` and `config device add`, so the second apply sees the world the
 // first one left behind and "no-op" is a claim about a converge that settled
@@ -649,7 +640,7 @@ function fakeIncus(options: FakeOptions = {}) {
    *
    * A reference without this endpoint's scope is a reference to somewhere else,
    * so it is a miss here rather than a hit — which is the whole point. `incus
-   * --project zabaca start cedarpad-ws` is well-formed and acts on the local
+   * --project zabaca start dev-ws` is well-formed and acts on the local
    * daemon; a fake that shrugged the scope off would let that pass.
    */
   const guestOr404 = (ref: string): FakeGuest =>
@@ -734,7 +725,7 @@ function fakeIncus(options: FakeOptions = {}) {
         return render()
       }
       if (flags === '--all-projects --format json') {
-        // Measured on ryzen-9, incus 6.0.0, 2026-08-18: the two flags are
+        // Measured on build-host, incus 6.0.0, 2026-08-18: the two flags are
         // mutually exclusive and incus says so rather than ignoring one.
         if (!projectless && across !== invocation)
           incusError(`Error: Can't specify --project with --all-projects`)
@@ -873,7 +864,6 @@ const APPLY_CTX = { secrets: {}, imports: {}, projectRoot: '/tmp' }
 // guest. Reading them for a guest that already exists makes every converge
 // depend on the operator's own `~/.ssh`, which is fine while one machine
 // converges and wrong the moment the Owner repo does it from anywhere
-// (ADR-0026 in the contributing repo).
 //
 // Found by applying an unchanged declaration from a second machine: the guest
 // was RUNNING and had been for days, and the apply died with
@@ -886,6 +876,7 @@ describe('a converge of an existing guest reads no key files', () => {
     })
     const result = await applyVm(daemon, {
       name: 'already-here',
+      sshUser: 'deploy',
       authorizedKeys: [KEY_A],
       authorizedKeyFiles: ['/definitely/not/a/path/authorized_keys'],
     })
@@ -902,6 +893,7 @@ describe('a converge of an existing guest reads no key files', () => {
     expect(
       applyVm(daemon, {
         name: 'brand-new',
+        sshUser: 'deploy',
         authorizedKeys: [KEY_A],
         authorizedKeyFiles: ['/definitely/not/a/path/authorized_keys'],
       }),
@@ -918,6 +910,7 @@ const destroyVm = (daemon: { exec: Exec }, config: Record<string, unknown>) =>
 /** The smallest declaration the schema accepts, plus a name per test. */
 const declare = (name: string, extra: Record<string, unknown> = {}) => ({
   name,
+  sshUser: 'deploy',
   authorizedKeys: [KEY_A],
   ...extra,
 })
@@ -933,7 +926,7 @@ describe('the apply creates the guest, and not only a plan of one', () => {
     const guest = daemon.guests.get('apply-creates')!
     expect(guest.status).toBe('Running')
     expect(guest.type).toBe('virtual-machine')
-    expect(result).toMatchObject({ created: true, changed: true, sshUser: 'foundry' })
+    expect(result).toMatchObject({ created: true, changed: true, sshUser: 'deploy' })
     // Read back off the daemon, which is why apply polls rather than composing
     // an address from config.
     expect(result.ipv4).toBe(guest.ipv4)
@@ -948,7 +941,7 @@ describe('the apply creates the guest, and not only a plan of one', () => {
 
     const seed = parse(daemon.guests.get('apply-seeds')!.config['cloud-init.user-data']!)
     expect(seed.users[0].ssh_authorized_keys).toEqual([KEY_A, KEY_B])
-    expect(seed.users[0].name).toBe('foundry')
+    expect(seed.users[0].name).toBe('deploy')
   })
 
   test('the seed is handed over through a temp file that does not outlive the apply', async () => {
@@ -956,7 +949,7 @@ describe('the apply creates the guest, and not only a plan of one', () => {
     // so it goes via a file rather than argv — and the file is removed in a
     // `finally`, which nothing else here would notice.
     const daemon = fakeIncus()
-    const seedFile = path.join(os.tmpdir(), 'foundry-cloud-init-apply-tmpfile.yaml')
+    const seedFile = path.join(os.tmpdir(), 'zbc-cloud-init-apply-tmpfile.yaml')
 
     await applyVm(daemon, declare('apply-tmpfile'))
 
@@ -1203,8 +1196,8 @@ describe('destroy', () => {
 
 // ── Absent means local, and "local" is these exact bytes ────────────────────
 //
-// `remote-guests/02` gives this module a `target`, and the whole safety
-// property of that change is the *absent* case: eight cedarpad-ws instances
+// `target` is what lets this module name a remote endpoint, and the whole
+// safety property of it is the *absent* case: eight dev-ws instances
 // plus agent-vm, ci-runner and agent-base declare no target and are running
 // production surfaces, so a declaration without one has to keep issuing the
 // commands it issued before the option existed.
@@ -1217,7 +1210,7 @@ describe('destroy', () => {
 
 // ── The guest that is already here, in another incus project ───────────────
 //
-// The trap `remote-guests/08` found, and it is not hypothetical: `cedarpad-ws`
+// A trap found in practice, and not hypothetical: `dev-ws`
 // was moved into the `zabaca` project by hand on 2026-08-18 and its declaration
 // still said nothing, so an apply would have looked in `default`, found nothing,
 // and built a second empty guest of the same name beside a production surface.
@@ -1226,11 +1219,11 @@ describe('destroy', () => {
 describe('findGuestInAnotherProject', () => {
   const rows = [
     { name: 'agent-vm', project: 'default' },
-    { name: 'cedarpad-ws', project: 'zabaca' },
+    { name: 'dev-ws', project: 'zabaca' },
   ]
 
   test('answers with the project holding a guest of that name', () => {
-    expect(findGuestInAnotherProject(rows, 'cedarpad-ws')).toBe('zabaca')
+    expect(findGuestInAnotherProject(rows, 'dev-ws')).toBe('zabaca')
   })
 
   test('a name nothing on the daemon carries is no finding', () => {
@@ -1248,31 +1241,31 @@ describe('findGuestInAnotherProject', () => {
     // The direction that makes findings disappear: read as "no clash", a moved
     // incus JSON shape would retire this guard in silence and put the create
     // path straight back where it was.
-    expect(() => findGuestInAnotherProject([{ name: 'cedarpad-ws' }], 'cedarpad-ws')).toThrow(
+    expect(() => findGuestInAnotherProject([{ name: 'dev-ws' }], 'dev-ws')).toThrow(
       /shape has moved/,
     )
-    expect(() =>
-      findGuestInAnotherProject([{ name: 'cedarpad-ws', project: '  ' }], 'cedarpad-ws'),
-    ).toThrow(/shape has moved/)
+    expect(() => findGuestInAnotherProject([{ name: 'dev-ws', project: '  ' }], 'dev-ws')).toThrow(
+      /shape has moved/,
+    )
   })
 
   test('but an unrelated row with no project is not this guard’s business', () => {
     // Deliberate scope: a name that cannot match cannot produce a finding
     // either way, and failing every create over some other guest's shape is
     // what gets a guard switched off.
-    expect(findGuestInAnotherProject([{ name: 'agent-vm' }], 'cedarpad-ws')).toBeNull()
+    expect(findGuestInAnotherProject([{ name: 'agent-vm' }], 'dev-ws')).toBeNull()
   })
 })
 
 describe('renderCrossProjectRefusal', () => {
   test('names the guest, where it is, and where the declaration was looking', () => {
     const message = renderCrossProjectRefusal({
-      name: 'cedarpad-ws',
+      name: 'dev-ws',
       found: 'zabaca',
       declared: 'default',
       verb: 'create',
     })
-    expect(message).toContain('cedarpad-ws')
+    expect(message).toContain('dev-ws')
     expect(message).toContain('`zabaca`')
     expect(message).toContain('`default`')
   })
@@ -1319,28 +1312,26 @@ describe('renderCrossProjectRefusal', () => {
 
 describe('the apply refuses to create a guest that already exists elsewhere', () => {
   test('the exact case: the declaration says default, the guest is in zabaca', async () => {
-    const daemon = fakeIncus({ elsewhere: [{ name: 'cedarpad-ws', project: 'zabaca' }] })
+    const daemon = fakeIncus({ elsewhere: [{ name: 'dev-ws', project: 'zabaca' }] })
 
-    await expect(applyVm(daemon, declare('cedarpad-ws'))).rejects.toThrow(/holds a guest called/)
+    await expect(applyVm(daemon, declare('dev-ws'))).rejects.toThrow(/holds a guest called/)
 
     // The claim that matters is not the throw — it is that nothing was built.
     // `mutations` excludes reads, so an empty one means no init, no config set,
     // no start reached the daemon.
     expect(daemon.mutations).toEqual([])
-    expect(daemon.guests.has('cedarpad-ws')).toBe(false)
+    expect(daemon.guests.has('dev-ws')).toBe(false)
   })
 
   test('and the message is the one that names both ways out', async () => {
     const daemon = fakeIncus({
       endpoint: { project: 'zabaca' },
-      elsewhere: [{ name: 'cedarpad-ws', project: 'default' }],
+      elsewhere: [{ name: 'dev-ws', project: 'default' }],
     })
 
     await expect(
-      applyVm(daemon, declare('cedarpad-ws', { target: { project: 'zabaca' } })),
-    ).rejects.toThrow(
-      /incus move cedarpad-ws cedarpad-ws --project default --target-project zabaca/,
-    )
+      applyVm(daemon, declare('dev-ws', { target: { project: 'zabaca' } })),
+    ).rejects.toThrow(/incus move dev-ws dev-ws --project default --target-project zabaca/)
   })
 
   test('a guest of that name in THIS project is a converge, not a clash', async () => {
@@ -1349,10 +1340,10 @@ describe('the apply refuses to create a guest that already exists elsewhere', ()
     // only reached once the scoped read came back empty.
     const daemon = fakeIncus({
       endpoint: { project: 'zabaca' },
-      guests: [{ name: 'cedarpad-ws', status: 'Running', ipv4: '10.196.88.9' }],
+      guests: [{ name: 'dev-ws', status: 'Running', ipv4: '10.196.88.9' }],
     })
 
-    const result = await applyVm(daemon, declare('cedarpad-ws', { target: { project: 'zabaca' } }))
+    const result = await applyVm(daemon, declare('dev-ws', { target: { project: 'zabaca' } }))
 
     expect(result.created).toBe(false)
     expect(daemon.commands.filter((c) => c.includes('--all-projects'))).toEqual([])
@@ -1389,9 +1380,9 @@ describe('the apply refuses to create a guest that already exists elsewhere', ()
 
 describe('destroy refuses to report a deletion it did not make', () => {
   test('a guest sitting in another project is not silently “already gone”', async () => {
-    const daemon = fakeIncus({ elsewhere: [{ name: 'cedarpad-ws', project: 'zabaca' }] })
+    const daemon = fakeIncus({ elsewhere: [{ name: 'dev-ws', project: 'zabaca' }] })
 
-    await expect(destroyVm(daemon, declare('cedarpad-ws'))).rejects.toThrow(/Nothing was deleted/)
+    await expect(destroyVm(daemon, declare('dev-ws'))).rejects.toThrow(/Nothing was deleted/)
     expect(daemon.mutations).toEqual([])
   })
 
@@ -1406,8 +1397,8 @@ describe('destroy refuses to report a deletion it did not make', () => {
   })
 })
 
-// `remote-guests/02` landed on the promise that these three lists were
-// byte-identical to what they had been before `target` existed. `remote-guests/11`
+// `target` landed on the promise that these three lists were byte-identical
+// to what they had been before it existed. A later change
 // spends exactly one byte of that, on purpose and in a separate change: the `=`
 // that joins `cloud-init.user-data` to its value, replacing the space that
 // spelled the same call in the form incus documents as backward compatibility.
@@ -1442,7 +1433,7 @@ describe('a declaration with no target renders what it rendered before, but for 
       // appears in `mutations`.
       'sudo incus list --all-projects --format json',
       "sudo incus init images:ubuntu/noble/cloud byte-identical --vm -s sessions --config 'limits.cpu=8' --config 'limits.memory=12GiB'",
-      'sudo incus config set byte-identical cloud-init.user-data="$(cat /tmp/foundry-cloud-init-byte-identical.yaml)"',
+      'sudo incus config set byte-identical cloud-init.user-data="$(cat /tmp/zbc-cloud-init-byte-identical.yaml)"',
       'sudo incus config device set byte-identical root size=40GiB',
       'sudo incus config device add byte-identical tun unix-char path=/dev/net/tun',
       'sudo incus start byte-identical',
@@ -1470,7 +1461,7 @@ describe('a declaration with no target renders what it rendered before, but for 
       'sudo incus list --format json',
       'sudo incus list --all-projects --format json',
       'sudo incus init images:ubuntu/noble/cloud byte-identical-override ',
-      'sudo incus config set byte-identical-override cloud-init.user-data="$(cat /tmp/foundry-cloud-init-byte-identical-override.yaml)"',
+      'sudo incus config set byte-identical-override cloud-init.user-data="$(cat /tmp/zbc-cloud-init-byte-identical-override.yaml)"',
       'sudo incus config device override byte-identical-override root size=50GiB',
       'sudo incus start byte-identical-override',
       'sudo incus exec byte-identical-override -- true',
@@ -1483,7 +1474,7 @@ describe('a declaration with no target renders what it rendered before, but for 
 
 // ── A declaration that names a target renders the remote form ───────────────
 //
-// The other half of `remote-guests/02`. `sudo` is *substituted away* rather
+// The other half of the `target` property. `sudo` is *substituted away* rather
 // than added to: the local socket is root-owned and needs it, a TLS endpoint
 // authenticates by client certificate and does not. Getting that backwards
 // produces a command that works by accident on this box — sudo here is
@@ -1491,10 +1482,10 @@ describe('a declaration with no target renders what it rendered before, but for 
 //
 // The fake is addressed, so these tests cannot pass by rendering a local
 // command that happened to work: a daemon that answers to `incus --project
-// zabaca` refuses `sudo incus`, and one that answers to `ryzen-9:` refuses a
+// zabaca` refuses `sudo incus`, and one that answers to `build-host:` refuses a
 // bare guest name. The two controls at the end are what prove that.
 
-const REMOTE: IncusTarget = { remote: 'ryzen-9', project: 'zabaca' }
+const REMOTE: IncusTarget = { remote: 'build-host', project: 'zabaca' }
 
 describe('a declaration that names a target reaches that endpoint instead', () => {
   test('every command of a full create, byte for byte', async () => {
@@ -1515,23 +1506,23 @@ describe('a declaration that names a target reaches that endpoint instead', () =
 
     // Compare against the local list at the top of this file: no `sudo`
     // anywhere, `--project zabaca` before the subcommand, and every guest name
-    // carrying `ryzen-9:` — including the bare `ryzen-9:` that `incus list`
+    // carrying `build-host:` — including the bare `build-host:` that `incus list`
     // takes positionally.
     expect(daemon.commands).toEqual([
-      'incus --project zabaca list ryzen-9: --format json',
+      'incus --project zabaca list build-host: --format json',
       // Projectless, and still remote and still without `sudo`: the project is
       // dropped because incus refuses it beside `--all-projects`, and nothing
       // else about the endpoint changes.
-      'incus list ryzen-9: --all-projects --format json',
-      "incus --project zabaca init images:ubuntu/noble/cloud ryzen-9:remote-create --vm -s sessions --config 'limits.cpu=8' --config 'limits.memory=12GiB'",
-      'incus --project zabaca config set ryzen-9:remote-create cloud-init.user-data="$(cat /tmp/foundry-cloud-init-remote-create.yaml)"',
-      'incus --project zabaca config device set ryzen-9:remote-create root size=40GiB',
-      'incus --project zabaca config device add ryzen-9:remote-create tun unix-char path=/dev/net/tun',
-      'incus --project zabaca start ryzen-9:remote-create',
-      'incus --project zabaca exec ryzen-9:remote-create -- true',
-      'incus --project zabaca exec ryzen-9:remote-create -- true',
-      'incus --project zabaca exec ryzen-9:remote-create -- cloud-init status --wait',
-      'incus --project zabaca list ryzen-9: --format json',
+      'incus list build-host: --all-projects --format json',
+      "incus --project zabaca init images:ubuntu/noble/cloud build-host:remote-create --vm -s sessions --config 'limits.cpu=8' --config 'limits.memory=12GiB'",
+      'incus --project zabaca config set build-host:remote-create cloud-init.user-data="$(cat /tmp/zbc-cloud-init-remote-create.yaml)"',
+      'incus --project zabaca config device set build-host:remote-create root size=40GiB',
+      'incus --project zabaca config device add build-host:remote-create tun unix-char path=/dev/net/tun',
+      'incus --project zabaca start build-host:remote-create',
+      'incus --project zabaca exec build-host:remote-create -- true',
+      'incus --project zabaca exec build-host:remote-create -- true',
+      'incus --project zabaca exec build-host:remote-create -- cloud-init status --wait',
+      'incus --project zabaca list build-host: --format json',
     ])
   })
 
@@ -1558,7 +1549,7 @@ describe('a declaration that names a target reaches that endpoint instead', () =
     // the shell on the machine running `incus`, so the multi-KB of YAML is read
     // here and travels as an argument. Nothing has to put a file on the remote.
     const daemon = fakeIncus({ endpoint: REMOTE })
-    const seedFile = path.join(os.tmpdir(), 'foundry-cloud-init-remote-seed.yaml')
+    const seedFile = path.join(os.tmpdir(), 'zbc-cloud-init-remote-seed.yaml')
 
     await applyVm(daemon, declare('remote-seed', { target: REMOTE }))
 
@@ -1590,7 +1581,9 @@ describe('a declaration that names a target reaches that endpoint instead', () =
     await destroyVm(daemon, declare('remote-doomed', { target: REMOTE }))
 
     expect(daemon.guests.has('remote-doomed')).toBe(false)
-    expect(daemon.commands).toContain('incus --project zabaca delete --force ryzen-9:remote-doomed')
+    expect(daemon.commands).toContain(
+      'incus --project zabaca delete --force build-host:remote-doomed',
+    )
   })
 
   test('the target is reported back, because that is how vm-provision inherits it', async () => {
@@ -1651,14 +1644,14 @@ describe('the addressed fake would notice — controls for the two tests above',
   })
 
   test('a remote daemon refuses a guest named without its scope', async () => {
-    // The silent one. `incus --project zabaca start cedarpad-ws` is well-formed
+    // The silent one. `incus --project zabaca start dev-ws` is well-formed
     // and acts on the LOCAL daemon, so a call site that applied the invocation
     // and forgot `guestRef` would act on the wrong machine and report success.
     const daemon = fakeIncus({ endpoint: REMOTE, guests: [{ name: 'unqualified' }] })
 
     await withExec(daemon.exec, async () => {
       expect(() => daemon.exec('incus --project zabaca start unqualified')).toThrow()
-      expect(() => daemon.exec('incus --project zabaca start ryzen-9:unqualified')).not.toThrow()
+      expect(() => daemon.exec('incus --project zabaca start build-host:unqualified')).not.toThrow()
     })
   })
 })

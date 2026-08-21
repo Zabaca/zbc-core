@@ -1,12 +1,3 @@
-// Contributed from foundry, 2026-08-19 — the third group to arrive that way,
-// after systemd-unit / host-file / docker-compose-stack on 2026-08-03 and the
-// four host primitives on 2026-08-18.
-//
-// The comments below cite `ADR-NNNN` and sibling test files by bare name. Those
-// are **foundry's**, not this repository's, and they are kept rather than
-// stripped because each one is the record of a failure that shaped the code —
-// a reference a reader can go and find beats a rationale nobody can check.
-
 import { describe, expect, test } from 'bun:test'
 import { type Exec, withExec } from '../host-exec'
 import {
@@ -30,8 +21,8 @@ function recorder(answers: Record<string, string> = {}) {
 }
 
 describe('incus', () => {
-  test('reaches the daemon through sudo, because uptown is not in incus-admin', async () => {
-    // Measured 2026-08-18: `incus version` as uptown reports "Server version:
+  test('reaches the daemon through sudo, because the invoking user is not in incus-admin', async () => {
+    // Measured 2026-08-18: `incus version` as an unprivileged user reports "Server version:
     // unreachable" while `sudo incus version` reports 6.0.0. The socket is
     // root:incus-admin and this user is in neither.
     const { seen, fake } = recorder()
@@ -98,7 +89,7 @@ describe('incusJson', () => {
 
 // ── Addressing one endpoint ────────────────────────────────────────────────
 //
-// The second form this file's header predicted. `remote-guests/02` gives a vm
+// The second form this file's header predicted: a vm
 // declaration a `target`, and these two functions are the whole of what that
 // changes about a command line: which `incus` is invoked, and how a guest is
 // named to it. They live here rather than in `vm` because the answer must be
@@ -120,7 +111,7 @@ describe('incusCommand', () => {
     // key, and a remote command that still said `sudo` would work by accident
     // on this box — where the invoking user has passwordless sudo — and fail
     // on every machine that is the actual point of the feature.
-    expect(incusCommand({ remote: 'ryzen-9' })).toBe('incus')
+    expect(incusCommand({ remote: 'build-host' })).toBe('incus')
   })
 
   test('an incus project is a global flag, and it is orthogonal to where the daemon is', () => {
@@ -129,25 +120,25 @@ describe('incusCommand', () => {
     // the endpoint shows. Foundry converging its own guest inside `zabaca`
     // would be local-and-projected, and it would still need root.
     expect(incusCommand({ project: 'zabaca' })).toBe('sudo incus --project zabaca')
-    expect(incusCommand({ remote: 'ryzen-9', project: 'zabaca' })).toBe('incus --project zabaca')
+    expect(incusCommand({ remote: 'build-host', project: 'zabaca' })).toBe('incus --project zabaca')
   })
 })
 
 describe('guestRef', () => {
   test('a guest on the local daemon is named bare', () => {
-    expect(guestRef(undefined, 'cedarpad-ws')).toBe('cedarpad-ws')
-    expect(guestRef({ project: 'zabaca' }, 'cedarpad-ws')).toBe('cedarpad-ws')
+    expect(guestRef(undefined, 'dev-ws')).toBe('dev-ws')
+    expect(guestRef({ project: 'zabaca' }, 'dev-ws')).toBe('dev-ws')
   })
 
   test('a guest on a remote carries the remote, or the command hits the wrong daemon', () => {
     // The silent half of the substitution. `incus --project zabaca start
-    // cedarpad-ws` is a valid command that runs against the LOCAL daemon,
+    // dev-ws` is a valid command that runs against the LOCAL daemon,
     // because an unqualified name means the default remote — so a call site
     // that applied the invocation and forgot the name would act on the wrong
     // machine and report success.
-    expect(guestRef({ remote: 'ryzen-9' }, 'cedarpad-ws')).toBe('ryzen-9:cedarpad-ws')
-    expect(guestRef({ remote: 'ryzen-9', project: 'zabaca' }, 'cedarpad-ws')).toBe(
-      'ryzen-9:cedarpad-ws',
+    expect(guestRef({ remote: 'build-host' }, 'dev-ws')).toBe('build-host:dev-ws')
+    expect(guestRef({ remote: 'build-host', project: 'zabaca' }, 'dev-ws')).toBe(
+      'build-host:dev-ws',
     )
   })
 
@@ -155,7 +146,7 @@ describe('guestRef', () => {
     // `incus list <remote>:` is the one place the remote appears without a
     // guest after it. Empty locally, so a caller can drop it and keep the
     // command it had.
-    expect(guestRef({ remote: 'ryzen-9' }, '')).toBe('ryzen-9:')
+    expect(guestRef({ remote: 'build-host' }, '')).toBe('build-host:')
     expect(guestRef(undefined, '')).toBe('')
   })
 })

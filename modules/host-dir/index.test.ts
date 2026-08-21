@@ -29,21 +29,20 @@ import { dirPlan, hostDirModule, modeOf, renderChownCommand, renderOwnerQuery } 
 
 // A fixture root this file owns and removes.
 //
-// Contributed from foundry, where the same call shape (`tmpFixture`) is backed
-// by a cross-run reaper the suite runner invokes — a design that exists because
-// `process.on('exit')` never fires under `bun test`, so ~50 files' `mkdtempSync`
-// calls had leaked 24 GB into /tmp. Core's `bun test` has no runner to hang a
-// reap off, so the discipline lands per file instead: one root, `afterAll`
-// removes it, and every call site below is unchanged.
+// One root per file, removed in `afterAll`, rather than a `mkdtempSync` per
+// test. `process.on('exit')` never fires under `bun test`, so per-test temp
+// directories are never reaped — roughly 50 files doing it that way had leaked
+// 24 GB into /tmp before the discipline landed.
 const ROOT = mkdtempSync(join(tmpdir(), 'host-dir-'))
 afterAll(() => rmSync(ROOT, { recursive: true, force: true }))
 
 const dir = () => mkdtempSync(join(ROOT, 'host-dir-'))
 
-const OWNER = 'uptown:uptown'
+const OWNER = 'deploy:deploy'
 
 /**
- * A small in-memory machine, not a call recorder — ADR-0023.
+ * A small in-memory machine, not a call recorder: it answers queries from
+ * modelled state, so a test asserts on behaviour rather than on call order.
  *
  * It renders `stat -c '%U:%G'` from state and it *parses* the `chown` back into
  * that state, so a second apply sees the world the first one left behind and
@@ -141,8 +140,8 @@ describe('what a declaration has to look like', () => {
   })
 
   test('an absolute path with an owner is accepted, and the mode has a default', () => {
-    const parsed = parse({ path: '/home/uptown/.local/share/foundry', owner: OWNER })
-    expect(parsed.path).toBe('/home/uptown/.local/share/foundry')
+    const parsed = parse({ path: '/home/deploy/.local/share/app', owner: OWNER })
+    expect(parsed.path).toBe('/home/deploy/.local/share/app')
     expect(parsed.owner).toBe(OWNER)
     expect(parsed.mode).toBe('0755')
   })
@@ -152,26 +151,25 @@ describe('what a declaration has to look like', () => {
     // and an apply that creates the store's directory inside a worktree
     // succeeds, reports a change, and leaves the real path untouched — the same
     // shape `host-symlink` refuses.
-    expect(() => parse({ path: '.local/share/foundry', owner: OWNER })).toThrow(/absolute/i)
+    expect(() => parse({ path: '.local/share/app', owner: OWNER })).toThrow(/absolute/i)
   })
 
   test('a path carrying shell metacharacters is refused', () => {
     // The path is interpolated into `stat` and `chown`, so anything outside the
     // allowed set is an injection seam rather than a typo — the reason
-    // `apt-packages` regex-validates package names and `tailscale-serve`
     // refuses metacharacters in a target.
     for (const path of [
-      '/home/uptown/store; rm -rf /',
-      '/home/uptown/$(id)',
-      '/home/uptown/two words',
-      '/home/uptown/store`id`',
+      '/home/deploy/store; rm -rf /',
+      '/home/deploy/$(id)',
+      '/home/deploy/two words',
+      '/home/deploy/store`id`',
     ])
       expect(() => parse({ path, owner: OWNER }), path).toThrow(/shell|characters/i)
   })
 
   test('an owner that is not user:group is refused', () => {
-    for (const owner of ['uptown', 'uptown:', ':uptown', 'uptown:uptown; id', '1000:1000 '])
-      expect(() => parse({ path: '/home/uptown/store', owner }), owner).toThrow(/user:group/i)
+    for (const owner of ['deploy', 'deploy:', ':deploy', 'deploy:deploy; id', '1000:1000 '])
+      expect(() => parse({ path: '/home/deploy/store', owner }), owner).toThrow(/user:group/i)
   })
 
   test('a mode that is not a four-digit octal string is refused', () => {
@@ -179,7 +177,7 @@ describe('what a declaration has to look like', () => {
     // declaration would look right, so the refusal is about the shape a reader
     // sees, not only about what the runtime can parse.
     for (const mode of ['755', '0999', 'rwxr-xr-x', '07555', ''])
-      expect(() => parse({ path: '/home/uptown/store', owner: OWNER, mode }), mode).toThrow(
+      expect(() => parse({ path: '/home/deploy/store', owner: OWNER, mode }), mode).toThrow(
         /octal/i,
       )
   })
@@ -188,7 +186,7 @@ describe('what a declaration has to look like', () => {
 // Everything above tests the half that *decides*. Nothing above runs the half
 // that writes — so gutting `apply` to `return { ...config, changed: false }`
 // would leave it green, and a module whose effect no test invokes is an effect
-// nobody has checked (ADR-0023's finding, in one sentence).
+// nobody has checked.
 describe('the apply creates the directory, and not only a plan of one', () => {
   test('an absent path becomes a directory at the declared mode, through parents that did not exist', async () => {
     const machine = fakeMachine()
@@ -249,15 +247,15 @@ describe('the apply creates the directory, and not only a plan of one', () => {
   })
 
   test('what is already inside the directory is left exactly as it was', async () => {
-    // The declared path is not empty on this box: `~/.local/share/foundry`
-    // already holds 1.4 GB of `claude-sessions/` that `services/claude-sync`
+    // The declared path is not empty on this box: `~/.local/share/app`
+    // already holds gigabytes of state that the owning application
     // writes. A recursive chmod would rewrite every one of those modes as a
     // side effect of declaring the directory that contains them.
     const machine = fakeMachine()
     const path = join(dir(), 'store')
     mkdirSync(path)
     chmodSync(path, 0o700)
-    const nested = join(path, 'claude-sessions')
+    const nested = join(path, 'sessions')
     mkdirSync(nested)
     chmodSync(nested, 0o700)
     const file = join(nested, 'session.jsonl')
@@ -338,7 +336,7 @@ describe('the owner is converged through the one exec seam', () => {
 
   test('a chown that exits 0 and changes nothing is caught by the read-back', async () => {
     // An exit code says the command ran, not that it worked. This is the same
-    // failure `tailscale-serve` re-reads for, and the only thing that can see
+    // failure the read-back exists for, and the only thing that can see
     // it is asking the machine again.
     const machine = fakeMachine({ owner: 'root:root', silent: true })
     const path = join(dir(), 'store')
@@ -365,23 +363,23 @@ describe('the commands sent to the machine', () => {
     // `stat -c '%U:%G'` rather than `statSync().uid` and a uid→name lookup:
     // one call, and the answer is already the string the config carries, so
     // neither side has to resolve anything.
-    expect(renderOwnerQuery('/home/uptown/store')).toBe("stat -c '%U:%G' /home/uptown/store")
+    expect(renderOwnerQuery('/home/deploy/store')).toBe("stat -c '%U:%G' /home/deploy/store")
   })
 
   test('the chown goes through sudo, because the case that needs it is a root-owned directory', () => {
-    // Matching the vm, systemd-unit, incus-storage-pool and apt-packages
+    // Matching the vm, systemd-unit and incus-storage-pool
     // convention on this host. Without it the one state a chown exists to fix
     // is the one state it cannot fix.
-    expect(renderChownCommand(OWNER, '/home/uptown/store')).toBe(
-      'sudo chown uptown:uptown /home/uptown/store',
+    expect(renderChownCommand(OWNER, '/home/deploy/store')).toBe(
+      'sudo chown deploy:deploy /home/deploy/store',
     )
   })
 })
 
 describe('there is no destroy', () => {
   test('removing the directory is a human act', () => {
-    // `apt-packages`' reasoning, and sharper here: this directory holds the
-    // only copy of the Ticket store (ADR-0025), so a `destroy` would be a code
+    // the same reasoning, and sharper here: this directory holds the
+    // only copy of the store, so a `destroy` would be a code
     // path nothing exercises until the day it deletes the thing it was written
     // to manage.
     expect(hostDirModule.destroy).toBeUndefined()

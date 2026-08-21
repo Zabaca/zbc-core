@@ -1,15 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 import { type Exec, exec, execStatus, withExec } from './index'
 
-// Contributed from foundry, 2026-08-18, with `host-exec/index.ts`. The
-// `ADR-NNNN` numbers and the `remote-guests/NN` ticket ids below are
-// **foundry's**, not this repository's — kept rather than stripped for the
-// reason its sibling gives, and named here so a reader does not resolve them
-// against an ADR of the same number that this repository may mint later.
-//
 // The seam has to be held to the standard it was built to impose.
 //
-// `tailscale-serve`'s tests now run its real `apply` against a fake machine, and
+// A converted module's tests run its real `apply` against a fake machine, and
 // that is the point of this module. But those tests only ever exercise the
 // *substituted* half: `withExec` installs a fake, so `executeOnThisMachine` —
 // the branch that actually reaches the box — is never entered by them. An
@@ -175,7 +169,7 @@ describe('substituting the machine', () => {
   })
 
   test('nesting restores the enclosing fake, not the machine', async () => {
-    // `tailscale-serve`'s own seam test asserts from an outer scope for exactly
+    // A module's own seam test asserts from an outer scope for exactly
     // this reason: an unwind that jumped straight back to the real machine would
     // look identical from inside a single-level test.
     const outer = record()
@@ -195,10 +189,10 @@ describe('substituting the machine', () => {
 
 // ── The options `vm` and `vm-provision` brought with them ───────────────────
 //
-// ADR-0023 said `ExecOptions` would carry `timeout` and nothing else until a
+// `ExecOptions` carries `timeout` and nothing else until a
 // module arrived needing more, and that each addition would come "with the
 // module that needs it and the test that exercises it". These three and
-// `execStatus` arrived with `remote-guests/01`, which converted `vm` (14 call
+// `execStatus` arrived with the work that converted `vm` (14 call
 // sites) and `vm-provision` (2). Each one below is a behaviour those modules
 // had under `execSync` and would have lost silently in the conversion, so each
 // test is written to fail against the seam as it was before them.
@@ -233,7 +227,7 @@ describe('maxBuffer', () => {
     // ENOBUFS. This is the test that made the option honest — measured on bun
     // 1.3.14, `maxBuffer: undefined` is *unbounded* rather than "the default",
     // so passing the option straight through would have removed the cap from
-    // every caller that never mentions it, `tailscale-serve` and `host-dir`
+    // every caller that never mentions it, `host-dir`
     // included. It went green either way; only the direction it is asserted in
     // says which.
     expect(() => exec(twoMegabytes)).toThrow(/ENOBUFS/)
@@ -276,7 +270,7 @@ describe('stream', () => {
 })
 
 describe('execStatus', () => {
-  // The non-throwing variant ADR-0023 named and left out. `vm` needs it at four
+  // The non-throwing variant, deliberately left out at first. `vm` needs it at four
   // call sites: `incus list` on a machine with no such guest, and two liveness
   // probes whose whole purpose is to fail until the guest answers. Written as a
   // throw-and-catch at every call site it would be four copies of the same

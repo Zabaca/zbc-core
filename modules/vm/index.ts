@@ -1,12 +1,3 @@
-// Contributed from foundry, 2026-08-19 — the third group to arrive that way,
-// after systemd-unit / host-file / docker-compose-stack on 2026-08-03 and the
-// four host primitives on 2026-08-18.
-//
-// The comments below cite `ADR-NNNN` and sibling test files by bare name. Those
-// are **foundry's**, not this repository's, and they are kept rather than
-// stripped because each one is the record of a failure that shaped the code —
-// a reference a reader can go and find beats a rationale nobody can check.
-
 import { z } from 'zod'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
@@ -27,7 +18,7 @@ import { defineModule } from '../../src/define-module'
 // instance importing this one.
 //
 // Shells out through `host-exec` rather than `execSync`, so a test can stand in
-// front of the daemon and run this module's real `apply` (ADR-0023). Before
+// front of the daemon and run this module's real `apply`. Before
 // that, nothing in the suite invoked the half of this module that creates
 // anything, and it could not: there is one incus daemon on this box, so a test
 // of the real thing would leave guests behind.
@@ -161,7 +152,7 @@ export function renderCloudInit(opts: {
     // keys that still answers "Permission denied (publickey)".
     write_files: [
       {
-        path: '/etc/ssh/sshd_config.d/60-foundry.conf',
+        path: '/etc/ssh/sshd_config.d/60-zbc.conf',
         permissions: '0644',
         content: [
           'PasswordAuthentication no',
@@ -324,8 +315,8 @@ interface IncusInstance {
 
 // `incus list <remote>:` scopes the listing to an endpoint; the scope is empty
 // locally, and dropped rather than emitted so the local command is unchanged.
-// Names come back bare either way — a remote reports `cedarpad-ws`, not
-// `ryzen-9:cedarpad-ws` — which is why the match below is still on config.name.
+// Names come back bare either way — a remote reports `dev-ws`, not
+// `build-host:dev-ws` — which is why the match below is still on config.name.
 function inspect(daemon: Daemon, name: string): IncusInstance | null {
   const { code, out } = daemon.runStatus(
     ['list', daemon.scope, '--format json'].filter(Boolean).join(' '),
@@ -346,18 +337,18 @@ function inspect(daemon: Daemon, name: string): IncusInstance | null {
 // created, and nothing in the diff or the output says which of the two the
 // service is now talking to.
 //
-// This happened for real on 2026-08-18: `cedarpad-ws` was moved into `zabaca`
+// This happened for real on 2026-08-18: `dev-ws` was moved into `zabaca`
 // by hand and its declaration still said nothing, so for a few hours any
 // whole-environment apply would have done exactly that to a production surface.
 //
 // The module refuses instead. It does not perform the move — that needs the
 // guest stopped, which is downtime on somebody's service in a window this
-// process did not choose, and ADR-0026 plans it as a human act with the
+// process did not choose, and it is planned as a human act with the
 // commands written down. What it can do is make the trap loud at the one moment
 // it would otherwise be silent, which costs one extra `incus list` on the
 // create path and nothing at all on the converge path.
 //
-// **Visibility is what makes it possible**, and it is ADR-0026's own finding:
+// **Visibility is what makes it possible**:
 // an incus project is a namespace on one daemon, so a listing across projects
 // still sees every guest whatever holds it. A restricted certificate sees only
 // the projects it is scoped to, so over such an endpoint this guard narrows to
@@ -496,12 +487,16 @@ export const vmModule = defineModule({
       storagePool: z.string().optional(),
       // Which incus daemon this guest lives on, and in which incus project.
       // **Absent means the local socket**, which is what every declaration in
-      // this repo says and what ADR-0026 settled item 4 keeps saying for
+      // this repo says and what the module keeps saying for
       // agent-vm, ci-runner and agent-base. A guest owned by another repo names
-      // one, and the commands become `incus --project zabaca … ryzen-9:<name>`
+      // one, and the commands become `incus --project zabaca … build-host:<name>`
       // with `sudo` substituted away rather than added to.
       target: incusTargetSchema.optional(),
-      sshUser: z.string().default('foundry'),
+      // No default: this names a real user created on every guest this module
+      // provisions, so it belongs to the consumer, not to whoever wrote the
+      // module. A missing value fails at parse time rather than silently
+      // creating someone else's username on the operator's infrastructure.
+      sshUser: z.string().min(1),
       authorizedKeys: z.array(z.string()).default([]),
       authorizedKeyFiles: z.array(z.string()).default([]), // e.g. "~/.ssh/id_ed25519.pub"
       userData: z.string().optional(), // extra cloud-config, merged over the baseline
@@ -616,7 +611,7 @@ export const vmModule = defineModule({
       //
       // Not `renderConfigPair`, which single-quotes the whole pair: that is
       // right for every other value here and would stop this one substituting.
-      const tmp = path.join(os.tmpdir(), `foundry-cloud-init-${config.name}.yaml`)
+      const tmp = path.join(os.tmpdir(), `zbc-cloud-init-${config.name}.yaml`)
       fs.writeFileSync(tmp, seed(), { mode: 0o600 })
       try {
         daemon.run(`config set ${daemon.ref(config.name)} cloud-init.user-data="$(cat ${tmp})"`)

@@ -1,12 +1,3 @@
-// Contributed from foundry, 2026-08-19 — the third group to arrive that way,
-// after systemd-unit / host-file / docker-compose-stack on 2026-08-03 and the
-// four host primitives on 2026-08-18.
-//
-// The comments below cite `ADR-NNNN` and sibling test files by bare name. Those
-// are **foundry's**, not this repository's, and they are kept rather than
-// stripped because each one is the record of a failure that shaped the code —
-// a reference a reader can go and find beats a rationale nobody can check.
-
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -156,12 +147,12 @@ afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }))
 
 const tempFile = (name: string) => path.join(fs.mkdtempSync(path.join(ROOT, 'cf-tunnel-')), name)
 
-/** The instance under test, mirroring the shape cedarpad-ws-tunnel will use. */
+/** The instance under test, mirroring the shape dev-ws-tunnel will use. */
 function instanceConfig(overrides: Record<string, unknown> = {}) {
   return {
     accountId: ACCOUNT,
-    tunnelName: 'cedarpad-ws',
-    apiToken: { from: 'cedarpad-ws-token', output: 'tokenValue' },
+    tunnelName: 'dev-ws',
+    apiToken: { from: 'dev-ws-token', output: 'tokenValue' },
     zone: 'cedarpad.com',
     ingress: [
       { hostname: 'ws.cedarpad.com', path: '^/__(boot|status)$', service: 'http://127.0.0.1:4599' },
@@ -171,7 +162,7 @@ function instanceConfig(overrides: Record<string, unknown> = {}) {
   }
 }
 
-const ctx = { secrets: {}, imports: { 'cedarpad-ws-token': { tokenValue: 'api-token' } } }
+const ctx = { secrets: {}, imports: { 'dev-ws-token': { tokenValue: 'api-token' } } }
 
 const apply = (config: Record<string, unknown>) =>
   cloudflareTunnelModule.apply(
@@ -384,7 +375,7 @@ describe('apply', () => {
 
     // config_src is what makes PUT /configurations authoritative at all.
     const create = world.calls.find((c) => c.method === 'POST' && c.url.endsWith('/cfd_tunnel'))
-    expect(create?.body).toEqual({ name: 'cedarpad-ws', config_src: 'cloudflare' })
+    expect(create?.body).toEqual({ name: 'dev-ws', config_src: 'cloudflare' })
 
     expect(world.ingress.get(TUNNEL_ID)).toEqual([
       { hostname: 'ws.cedarpad.com', path: '^/__(boot|status)$', service: 'http://127.0.0.1:4599' },
@@ -447,7 +438,7 @@ describe('apply', () => {
 
   test('refuses to adopt a locally-managed tunnel instead of silently no-opping', async () => {
     const world = emptyWorld()
-    world.tunnels.push({ id: TUNNEL_ID, name: 'cedarpad-ws', config_src: 'local' })
+    world.tunnels.push({ id: TUNNEL_ID, name: 'dev-ws', config_src: 'local' })
     world.ingress.set(TUNNEL_ID, [])
     installFetch(world)
 
@@ -469,7 +460,7 @@ describe('apply', () => {
     const world = emptyWorld()
     world.tunnels.push({
       id: 'dead-tunnel',
-      name: 'cedarpad-ws',
+      name: 'dev-ws',
       config_src: 'cloudflare',
       deleted_at: '2026-01-01T00:00:00Z',
     })

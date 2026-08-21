@@ -1,12 +1,3 @@
-// Contributed from foundry, 2026-08-19 — the third group to arrive that way,
-// after systemd-unit / host-file / docker-compose-stack on 2026-08-03 and the
-// four host primitives on 2026-08-18.
-//
-// The comments below cite `ADR-NNNN` and sibling test files by bare name. Those
-// are **foundry's**, not this repository's, and they are kept rather than
-// stripped because each one is the record of a failure that shaped the code —
-// a reference a reader can go and find beats a rationale nobody can check.
-
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import { z } from 'zod'
@@ -106,7 +97,8 @@ const ingressRuleSchema = z
 export type IngressRule = z.infer<typeof ingressRuleSchema>
 
 const configSchema = z.object({
-  /** Cloudflare account id. Instance config, never a constant — ADR-0004. */
+  /** Cloudflare account id. Instance config, never a constant: one zbc project
+   *  may span accounts, and a constant would silently converge into the wrong one. */
   accountId: z.string(),
   /** Tunnel name — the converge identity. One instance per name. */
   tunnelName: z.string().min(1),

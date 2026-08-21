@@ -1,23 +1,14 @@
-// Contributed from foundry, 2026-08-19 — the third group to arrive that way,
-// after systemd-unit / host-file / docker-compose-stack on 2026-08-03 and the
-// four host primitives on 2026-08-18.
-//
-// The comments below cite `ADR-NNNN` and sibling test files by bare name. Those
-// are **foundry's**, not this repository's, and they are kept rather than
-// stripped because each one is the record of a failure that shaped the code —
-// a reference a reader can go and find beats a rationale nobody can check.
-
 /**
  * What `incus config set --help` says its argv is, read out of the binary.
  *
  * Not production code that runs during an apply: this is the anchor two
  * modules' tests share. It lives beside the transcript, in `incus-core`,
- * because `vm` and `incus-listener` both render a `config set` and both need
+ * because more than one module renders a `config set` and they need
  * the same answer to the same question — and a second copy of the question is
  * how the two renderers would come to disagree with the binary separately.
  *
  * The transcript is `incus config set --help` captured verbatim from incus
- * 6.0.0 on ryzen-9 on 2026-08-18: stdout, exit 0, no daemon and no sudo, and
+ * 6.0.0 on build-host on 2026-08-18: stdout, exit 0, no daemon and no sudo, and
  * byte-identical at `COLUMNS=40`, at `COLUMNS=200` and through a pipe, so it is
  * a transcript rather than a rendering of one terminal. `vm`'s suite re-derives
  * it from the binary on every run, which is what stops it becoming a frozen
@@ -70,7 +61,7 @@ export function parseConfigSetForms(help: string): {
  * `incus config set <a> <b>` with two argv words and no `=` is not an instance
  * set but a *server* one. The Examples section is where the help states that
  * call in full, so it is the only part of the transcript that answers the
- * question `incus-listener` is asking.
+ * question a server-scoped `config set` is asking.
  *
  * Located by the `core.` prefix rather than by position: every server key incus
  * documents carries it, and an instance example (`limits.cpu=2`) does not.

@@ -1,41 +1,34 @@
-// Contributed from foundry, 2026-08-19 — the third group to arrive that way,
-// after systemd-unit / host-file / docker-compose-stack on 2026-08-03 and the
-// four host primitives on 2026-08-18.
-//
-// The comments below cite `ADR-NNNN` and sibling test files by bare name. Those
-// are **foundry's**, not this repository's, and they are kept rather than
-// stripped because each one is the record of a failure that shaped the code —
-// a reference a reader can go and find beats a rationale nobody can check.
-
 import { z } from 'zod'
 import { type ExecOptions, exec } from '../host-exec'
 
 // incus-core — one door to the incus daemon, for the modules that declare its
 // server-side state.
 //
-// Three modules converge incus itself rather than a guest — `incus-listener`,
-// `incus-project` and `incus-trust` — and all three need the same two lines: a
-// `sudo incus` invocation with a timeout, and a JSON list read back from it.
-// Written out three times that is exactly what `declared-once.test.ts` catches,
-// and rightly: unlike the `sleep` and `run` pairs that test registers as
-// deliberate, **there is a version of this that drifts into a bug.** The `sudo`
-// prefix is a decision about how this repo reaches the daemon, not a coincidence
-// of two modules needing the same wrapper — and `remote-guests/02` is about to
-// add a second form of it, where the prefix becomes `incus --project <p>` and
-// `sudo` disappears because a remote endpoint authenticates as an ordinary user.
-// One place to add that is the point. Same shape as `tailscale-core` and
-// `provision-core`: a directory under `modules/` that is not itself a module.
+// Every module that reaches the daemon needs the same two lines: an `incus`
+// invocation with a timeout, and a JSON list read back from it. Written out per
+// module that drifts into a bug rather than merely duplicating — because the
+// `sudo` prefix is a decision about how this repo reaches the daemon, not a
+// coincidence of two modules needing the same wrapper, and there is a second
+// form of it where the prefix becomes `incus --project <p>` and `sudo`
+// disappears, because a remote endpoint authenticates as an ordinary user.
+// One place to add that is the point.
+//
+// Same shape as `provision-core`: a directory under `modules/` that is not
+// itself a module. Note what is NOT here — nothing in zbc converges the daemon
+// itself. There is no module to enable the network listener, create a project,
+// or add client-certificate trust, so a `target` naming a remote assumes a
+// daemon someone configured by hand.
 //
 // **Why sudo, measured rather than assumed.** The incus socket is
-// `root:incus-admin`, and `uptown` — the user an apply runs as — is in neither.
+// `root:incus-admin`, and the user an apply runs as is typically in neither.
 // On 2026-08-18 `incus version` as that user printed "Server version:
 // unreachable" while `sudo incus version` printed 6.0.0. Adding the user to
 // `incus-admin` would be the alternative and is worse: group membership on that
 // socket is unconditional admin over every project, which is precisely the
-// authority ADR-0026 declines to hand out.
+// authority this module declines to hand out.
 //
 // Routed through `host-exec` rather than `execSync` so a test can stand in front
-// of the machine and run these modules' real `apply` (ADR-0023). Nothing here
+// of the machine and run these modules' real `apply`. Nothing here
 // widens `ExecOptions`; every call is a command with a timeout, and every incus
 // subcommand these modules use exits 0 on the paths they read, so the
 // non-throwing `runStatus` variant that four unconverted modules carry is not
@@ -54,8 +47,7 @@ export const INCUS_TIMEOUT_MS = 60_000
  * One copy rather than one per module: every name matched by it is interpolated
  * into an `incus` command built here, so this is a decision about what this
  * repo will hand a shell and not a coincidence of two modules validating
- * strings. `declared-once.test.ts` caught the second copy the day it was
- * written, which is the rule working rather than the rule being awkward.
+ * strings.
  */
 export const PLAIN_INCUS_NAME = /^[a-z0-9][a-z0-9-]*$/
 
@@ -68,7 +60,7 @@ export const PLAIN_INCUS_NAME = /^[a-z0-9][a-z0-9-]*$/
  * no byte of the command line.
  */
 export interface IncusTarget {
-  /** A configured incus remote, e.g. `ryzen-9`. Absent means the local socket. */
+  /** A configured incus remote, e.g. `build-host`. Absent means the local socket. */
   remote?: string
   /** An incus project, e.g. `zabaca`. Absent means the endpoint's default. */
   project?: string
@@ -89,7 +81,7 @@ export const incusTargetSchema = z.object({
  *
  * **`sudo` is a substitution, not decoration.** It is here because the local
  * socket is `root:incus-admin` and the user an apply runs as is in neither
- * group (measured 2026-08-18: `incus version` as `uptown` says "Server version:
+ * group (measured 2026-08-18: `incus version` unprivileged says "Server version:
  * unreachable", `sudo incus version` says 6.0.0). A remote endpoint is TLS and
  * authenticates as whoever holds the client certificate, so `sudo` there is not
  * merely unnecessary — it would elevate to a *local* root that has nothing to
@@ -115,10 +107,10 @@ export function incusCommand(target?: IncusTarget): string {
  *
  * The invocation above is not enough on its own, and the gap is silent: an
  * unqualified name means the *default* remote, so `incus --project zabaca start
- * cedarpad-ws` is a well-formed command that acts on the local daemon and
+ * dev-ws` is a well-formed command that acts on the local daemon and
  * reports success. Every call site that names a guest goes through here.
  *
- * With an empty name it is the bare scope — `ryzen-9:` — which is the form
+ * With an empty name it is the bare scope — `build-host:` — which is the form
  * `incus list <remote>:` takes, and empty locally so the caller drops it.
  */
 export function guestRef(target: IncusTarget | undefined, name: string): string {
@@ -131,7 +123,7 @@ export function guestRef(target: IncusTarget | undefined, name: string): string 
  *
  * Local by construction and deliberately not target-aware: the three modules
  * that use it converge the *substrate* — the listener, the projects, the trust
- * entries — which ADR-0026 keeps as foundry's own and which by definition runs
+ * entries — which stay the operator's own and which by definition run
  * on the box holding the socket. `vm` and `vm-provision` are the guest-facing
  * pair and they take a target; they build their own runner on the two
  * renderers above rather than calling this one, and `vm`'s header says why.
@@ -182,10 +174,9 @@ export function incusJson<T>(args: string, options?: ExecOptions): T {
  * from the machine: `H` is hours and `m` is *months*, so `1h` and `1M` are both
  * things a reader would write meaning something else.
  *
- * Two modules need it and they need it in opposite directions —
- * `incus-listener` refuses a declaration the daemon would reject, and the
- * enrolment path refuses to issue against a daemon whose expiry is not a real
- * one — so it lives here rather than being written twice.
+ * Two callers need it in opposite directions — one refuses a declaration the
+ * daemon would reject, the other refuses to issue against a daemon whose expiry
+ * is not a real one — so it lives here rather than being written twice.
  */
 export const EXPIRY_EXPRESSION = /^(\d+)(S|M|H|d|w|m|y)$/
 

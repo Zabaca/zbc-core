@@ -20,12 +20,10 @@ import { maskPlan, MASK_TARGET, userUnitPath } from './index'
 
 // A fixture root this file owns and removes.
 //
-// Contributed from foundry, where the same call shape (`tmpFixture`) is backed
-// by a cross-run reaper the suite runner invokes — a design that exists because
-// `process.on('exit')` never fires under `bun test`, so ~50 files' `mkdtempSync`
-// calls had leaked 24 GB into /tmp. Core's `bun test` has no runner to hang a
-// reap off, so the discipline lands per file instead: one root, `afterAll`
-// removes it, and every call site below is unchanged.
+// One root per file, removed in `afterAll`, rather than a `mkdtempSync` per
+// test. `process.on('exit')` never fires under `bun test`, so per-test temp
+// directories are never reaped — roughly 50 files doing it that way had leaked
+// 24 GB into /tmp before the discipline landed.
 const ROOT = mkdtempSync(join(tmpdir(), 'systemd-mask-'))
 afterAll(() => rmSync(ROOT, { recursive: true, force: true }))
 
@@ -107,8 +105,8 @@ describe('what a home directory has to look like to become a path', () => {
   })
 
   test('an absolute home still resolves the real path', () => {
-    expect(userUnitPath('xdg-desktop-portal-gtk.service', '/home/uptown')).toBe(
-      '/home/uptown/.config/systemd/user/xdg-desktop-portal-gtk.service',
+    expect(userUnitPath('xdg-desktop-portal-gtk.service', '/home/deploy')).toBe(
+      '/home/deploy/.config/systemd/user/xdg-desktop-portal-gtk.service',
     )
   })
 })

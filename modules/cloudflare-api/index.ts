@@ -1,19 +1,10 @@
-// Contributed from foundry, 2026-08-19 — the third group to arrive that way,
-// after systemd-unit / host-file / docker-compose-stack on 2026-08-03 and the
-// four host primitives on 2026-08-18.
-//
-// The comments below cite `ADR-NNNN` and sibling test files by bare name. Those
-// are **foundry's**, not this repository's, and they are kept rather than
-// stripped because each one is the record of a failure that shaped the code —
-// a reference a reader can go and find beats a rationale nobody can check.
-
 // The parts of "talk to the Cloudflare API" that no module should own twice:
 // the base URL, the envelope Cloudflare wraps every response in, and the rule
 // for reading a credential out of an imported instance's outputs.
 //
 // Extracted the way `provision-core` was extracted, and for the same reason its
 // header gives. `cloudflare-zone` wrote these first; `cloudflare-tunnel` needed
-// the identical four and `declared-once.test.ts` caught the copy on the apply
+// the identical four, and the duplication was caught on the apply
 // that introduced it — which is the whole point of that test, since the
 // previous convention was a comment asking a human to notice, and by the time
 // anybody counted the Cloudflare resolver was at four copies.

@@ -1,12 +1,3 @@
-// Contributed from foundry, 2026-08-19 — the third group to arrive that way,
-// after systemd-unit / host-file / docker-compose-stack on 2026-08-03 and the
-// four host primitives on 2026-08-18.
-//
-// The comments below cite `ADR-NNNN` and sibling test files by bare name. Those
-// are **foundry's**, not this repository's, and they are kept rather than
-// stripped because each one is the record of a failure that shaped the code —
-// a reference a reader can go and find beats a rationale nobody can check.
-
 import { createHash } from 'node:crypto'
 
 // The parts of "converge the inside of a machine" that do not care how the
@@ -18,7 +9,7 @@ import { createHash } from 'node:crypto'
 // do not host (the vultr exit node) over SSH. Everything below is identical
 // for both, and duplicating it would mean two digests that drift.
 
-export const MARKER_DIR = '/var/lib/foundry-provision'
+export const MARKER_DIR = '/var/lib/zbc-provision'
 
 /** POSIX single-quote escaping: close, escape, reopen. */
 export const sq = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`

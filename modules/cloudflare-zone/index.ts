@@ -1,12 +1,3 @@
-// Contributed from foundry, 2026-08-19 — the third group to arrive that way,
-// after systemd-unit / host-file / docker-compose-stack on 2026-08-03 and the
-// four host primitives on 2026-08-18.
-//
-// The comments below cite `ADR-NNNN` and sibling test files by bare name. Those
-// are **foundry's**, not this repository's, and they are kept rather than
-// stripped because each one is the record of a failure that shaped the code —
-// a reference a reader can go and find beats a rationale nobody can check.
-
 import { z } from 'zod'
 import { defineModule } from '../../src/define-module'
 import { cf, cfRaw, resolveApiToken } from '../cloudflare-api'
@@ -63,7 +54,7 @@ import { cf, cfRaw, resolveApiToken } from '../cloudflare-api'
 // so `proxied: false` on a TXT can never read as a considered choice.
 //
 // ── Account-parameterised ─────────────────────────────────────────────────
-// `accountId` is instance config, never a constant: ADR-0004 puts each Client's
+// `accountId` is instance config, never a constant: each client's
 // zone in that Client's own Cloudflare account. Apply refuses outright if the
 // looked-up zone belongs to a different account than the one declared — the
 // cheapest possible guard against converging the right records into the wrong
@@ -134,7 +125,7 @@ export type RecordConfig = z.infer<typeof recordSchema>
 
 const configSchema = z
   .object({
-    /** Cloudflare account id. Instance config, never a constant — ADR-0004. */
+    /** Cloudflare account id. Instance config, never a constant. */
     accountId: z.string(),
     /** Zone apex, e.g. `varnick.com`. The converge identity. */
     zone: z.string(),
@@ -494,7 +485,7 @@ export const cloudflareZoneModule = defineModule({
       throw new Error(
         `refusing to apply: zone "${config.zone}" lives in Cloudflare account ${zone.account.id}, ` +
           `but this instance declares ${config.accountId}. Each zone belongs to exactly one ` +
-          `account (ADR-0004); converging the right records into the wrong tenant is not a ` +
+          `account; converging the right records into the wrong tenant is not a ` +
           `mistake worth being able to make.`,
       )
     }

@@ -1,54 +1,30 @@
-// Contributed from foundry, 2026-08-18 — the second group of host-converging
-// modules to arrive that way, after systemd-unit / host-file /
-// docker-compose-stack on 2026-08-03.
-//
-// The comments below cite `ADR-NNNN` and sibling test files by bare name. Those
-// are **foundry's**, not this repository's, and they are kept rather than
-// stripped because each one is the record of a failure that shaped the code —
-// a reference a reader can go and find beats a rationale nobody can check.
 import { execSync } from 'node:child_process'
 
 // host-exec — the one place a module reaches the machine by running a command,
 // and the only place a test can stand in front of it.
 //
-// **Why this exists.** An audit on 2026-08-15 found that 14 of the 17
-// apply-bearing modules in this directory have an `apply` no test invokes:
-// gutting `apply` to a no-op left the suite byte-identical. The three that did
-// verify theirs were the Cloudflare modules, which replace `globalThis.fetch`
-// and run the *real* apply against an in-memory Cloudflare — proof that the
-// property is reachable, and the pattern this file generalises to commands.
+// **Why this exists.** A module's `apply` runs commands against the machine,
+// and a command against global machine state has no equivalent of a temp
+// directory — there is only one machine. Without a seam, gutting an `apply` to
+// a no-op leaves the suite byte-identical: the tests exercise the schema and
+// nothing else. The Cloudflare modules avoid that by replacing
+// `globalThis.fetch` and running the real `apply` against an in-memory
+// Cloudflare, which proves the property is reachable. This file generalises
+// that pattern from requests to commands: the thing that cannot be duplicated
+// has to be substitutable instead.
 //
-// Two of the fourteen needed no new mechanism, because `host-symlink` and
-// `claude-settings` touch the filesystem and a filesystem has temp directories;
-// both were converted the same day, which is why the count is 12 rather than 14
-// by the time this file exists — and 11 once `tailscale-serve` lands. The rest
-// hardcode `execSync` against global machine state — `tailscale serve`, `incus`,
-// `apt-get`, `gh` — where there is no equivalent of a temp directory, because
-// the machine is the only one there is. Hence a seam rather than a harness: the
-// thing that cannot be duplicated has to be substitutable instead. Two of the
-// eleven are not this file's to take: `tailscale-acl` and `tailscale-authkey`
-// reach the Tailscale API over `fetch`, so they convert the Cloudflare way.
-//
-// **This was already asked for, in writing.** `declared-once.test.ts` registers
-// a duplicated `run` across `apt-packages` and `incus-storage-pool` and says of
-// it: "Collapse it the way provision-core was collapsed if a third copy
-// appears — `vm` and `git-worktree` each already have a `run` with a different
-// signature, so the count is closer than it looks." That registry entry retires
-// when those modules convert; this file is where they converge.
+// Modules that only touch the filesystem (`host-symlink`, `host-dir`) need no
+// seam — a filesystem does have temp directories, so those run for real in
+// tests. Modules that reach an API over `fetch` convert the Cloudflare way.
+// This is for the rest: `incus`, `systemctl`, package managers, anything whose
+// effect is the machine itself.
 //
 // **Why a mutable binding rather than a parameter.** The obvious home for this
 // is `ApplyContext`, which the engine already threads into every `apply`.
 // Widening the engine's own contract to carry a property only tests observe
 // makes every consumer pay for one consumer's test strategy — the seam is a
 // module-layer concern and `src/types.ts` is the wrong place to express it.
-// ADR-0023.
-//
-// In foundry, where this was written, that argument came second: `ApplyContext`
-// was reachable only through the `vendor/zbc/` subtree, whose commits ADR-0007
-// forbids mixing with other paths, so widening it meant a push-and-pull round
-// trip per iteration. That half no longer applies here — this file now lives
-// beside `src/types.ts` — and it is recorded rather than deleted because the
-// reason that survives is the one that generalises.
+
 //
 // **Why not a mock library.** A library asserts on *calls*. What makes the
 // Cloudflare tests honest is that their stub is a small in-memory version of the
@@ -57,12 +33,11 @@ import { execSync } from 'node:child_process'
 // The seam is deliberately thin enough that the interesting object is the fake
 // the test writes, not this file.
 //
-// **The surface grows with its consumers, on purpose.** `ExecOptions` carried
-// `timeout` and nothing else while `tailscale-serve` was the only converted
-// module, because that is all it uses. `input`, `maxBuffer` and `stream` arrived
-// with `vm` and `vm-provision` — the ADR names the first two by their absence
-// and says each "arrives with the module that needs it and the test that
-// exercises it", which is the standard they are held to below: every one of them
+// **The surface grows with its consumers, on purpose.** `ExecOptions` began as
+// `timeout` and nothing else, because that is all the first consumer used.
+// `input`, `maxBuffer` and `stream` arrived with `vm` and `vm-provision`. Each
+// option arrives with the module that needs it and the test that exercises it,
+// which is the standard they are held to below: every one of them
 // is a behaviour those modules already had under `execSync` and would have lost
 // silently in the conversion, and every one has a test that fails without it.
 // `cwd` is still absent, because nothing has needed it yet.
@@ -161,7 +136,7 @@ export const exec: Exec = (command, options) => installed(command, options)
  * the body's promise settles. Both halves matter: a set/restore pair leaks the
  * fake into every later test in the file when the body throws, and a restore
  * that does not await hands the real machine back in the middle of an
- * in-flight `apply` — which for these modules means a real `tailscale serve` or
+ * in-flight `apply` — which for these modules means a real `incus` call or
  * `incus` call from a unit test.
  */
 export async function withExec<T>(fake: Exec, body: () => Promise<T>): Promise<T> {

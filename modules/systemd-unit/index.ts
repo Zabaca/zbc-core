@@ -15,7 +15,7 @@ const sh = (cmd: string) => execSync(cmd, { stdio: ['ignore', 'pipe', 'pipe'] })
 export const systemdUnitModule = defineModule({
   name: 'systemd-unit',
   configSchema: z.object({
-    // e.g. "foundry-transcribe.service". Restricted to systemd-legal name
+    // e.g. "transcribe.service". Restricted to systemd-legal name
     // characters — the name is interpolated into shell commands below, so
     // whitespace/metacharacters are config errors, not injection vectors.
     unit: z.string().regex(/^[A-Za-z0-9:@_.\\-]+$/, 'not a plain systemd unit name'),
@@ -27,9 +27,7 @@ export const systemdUnitModule = defineModule({
   apply: async (config) => {
     const user = config.scope === 'user'
     const ctl = user ? 'systemctl --user' : 'sudo systemctl'
-    const dir = user
-      ? path.join(os.homedir(), '.config/systemd/user')
-      : '/etc/systemd/system'
+    const dir = user ? path.join(os.homedir(), '.config/systemd/user') : '/etc/systemd/system'
     const unitPath = path.join(dir, config.unit)
 
     const existing = fs.existsSync(unitPath) ? fs.readFileSync(unitPath, 'utf8') : null
