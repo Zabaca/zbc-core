@@ -14,6 +14,8 @@ import {
   policyServiceTokens,
   serviceTokenIncludes,
   serviceTokenPolicyNameFor,
+  signInWith,
+  appDiffers,
 } from './index'
 
 /**
@@ -611,7 +613,14 @@ interface World {
   org: { name?: string; auth_domain?: string }
   providers: IdentityProvider[]
   tokens: Array<{ id: string; name: string; client_id: string }>
-  apps: Array<{ id: string; aud: string; name: string; domain: string; session_duration?: string }>
+  apps: Array<{
+    id: string
+    aud: string
+    name: string
+    domain: string
+    session_duration?: string
+    [field: string]: unknown
+  }>
   policies: Array<AccessPolicy & { appId: string }>
   calls: Array<{ method: string; url: string; body?: Record<string, unknown> }>
   rotations: number
@@ -692,26 +701,23 @@ function installFetch(world: World): void {
       return ok({ ...t, client_secret: 'SECRET-2' })
     }
 
+    // THE WHOLE BODY IS STORED, because the real API answers with every field
+    // it was sent. A stub that kept only name, domain and session duration was
+    // fine while the module compared only those three — and the moment the
+    // comparison was derived from the body instead, four "the second apply
+    // changes nothing" tests went red against a fixture that could never have
+    // matched. The stub was less faithful than the thing it models, and the
+    // assertions it carried were weaker than they read.
     if (pathname === `${B}/access/apps`) {
       if (method === 'GET') return ok(world.apps)
-      const a = {
-        id: `app-${n++}`,
-        aud: 'a'.repeat(64),
-        name: String(body?.name),
-        domain: String(body?.domain),
-        session_duration: String(body?.session_duration),
-      }
+      const a = { id: `app-${n++}`, aud: 'a'.repeat(64), ...body } as (typeof world.apps)[number]
       world.apps.push(a)
       return ok(a)
     }
     const appOne = pathname.match(new RegExp(`^${B}/access/apps/([^/]+)$`))
     if (appOne) {
       const a = world.apps.find((x) => x.id === appOne[1])!
-      Object.assign(a, {
-        name: body?.name,
-        domain: body?.domain,
-        session_duration: body?.session_duration,
-      })
+      Object.assign(a, body)
       return ok(a)
     }
 
@@ -1272,6 +1278,187 @@ describe('identity providers are never deleted, on any path', () => {
     for (const line of providerCalls) {
       expect(line, line.trim()).not.toContain('DELETE')
     }
+  })
+})
+
+/**
+ * TWO REPORTING DEFECTS IN ONE FAMILY: the module saying something untrue about
+ * what it just did. Neither misconfigures anything, and that is exactly why
+ * both survived a release — nothing fails, somebody just reads a wrong line.
+ */
+describe('what the apply says about signing in', () => {
+  test('an instance declaring no provider reports the ones a person can use', () => {
+    // The line answers "can a person sign in", not "what did this instance
+    // declare". Declaring none is the RECOMMENDED configuration when the
+    // organisation already offers what is needed — declaring one converges
+    // nothing and needs write access over state four other applications share —
+    // so the recommended case was the one that read as an open contradiction of
+    // the two lines printed just above it.
+    expect(signInWith({ declared: [], undeclared: ['onetimepin', 'cloudflare'] })).toBe(
+      'onetimepin, cloudflare',
+    )
+  })
+
+  test('a declared provider and an undeclared one are both ways in', () => {
+    expect(signInWith({ declared: ['onetimepin'], undeclared: ['cloudflare'] })).toBe(
+      'onetimepin, cloudflare',
+    )
+  })
+
+  test('an organisation offering nothing still says so', () => {
+    // The mirror case, and the reason this is not just "print more". If the
+    // organisation really offers no provider, the line must still say nobody
+    // can sign in — otherwise the fix trades a false alarm for a false
+    // reassurance, which is the worse of the two.
+    expect(signInWith({ declared: [], undeclared: [] })).toBe('(nothing, so nobody can sign in)')
+  })
+})
+
+describe('the summary line an apply actually prints', () => {
+  // Exporting a correct helper and not calling it would leave every apply as
+  // wrong as it was, so this drives the REAL apply and reads what it printed.
+  // The module's own history has this failure in it twice over — `announce`
+  // and `describeCfErrors` both needed a test at the call site rather than at
+  // the function — and a mutation that reverts the call site is otherwise
+  // invisible.
+  const printed: string[] = []
+  const realLog = console.log
+  afterEach(() => {
+    console.log = realLog
+    printed.length = 0
+  })
+  const capture = () => {
+    console.log = (...args: unknown[]) => void printed.push(args.join(' '))
+  }
+
+  test('names the providers the organisation offers, declared or not', async () => {
+    const world = emptyWorld({
+      providers: [
+        { id: 'idp-otp', type: 'onetimepin', name: '' },
+        { id: 'idp-cf', type: 'cloudflare', name: '' },
+      ],
+    })
+    installFetch(world)
+    capture()
+    await apply({ emails: ['james@zabaca.com'] })
+    console.log = realLog
+
+    const line = printed.find((l) => l.includes('sign in with'))
+    expect(line).toBeDefined()
+    expect(line).toContain('onetimepin')
+    expect(line).toContain('cloudflare')
+    expect(line).not.toContain('nobody can sign in')
+  })
+
+  test('an organisation offering nothing is still reported as offering nothing', async () => {
+    const world = emptyWorld({ providers: [] })
+    installFetch(world)
+    capture()
+    await apply({ emails: ['james@zabaca.com'] })
+    console.log = realLog
+
+    expect(printed.find((l) => l.includes('sign in with'))).toContain('nobody can sign in')
+  })
+
+  test('the apply names the fields it changed, rather than a bare "changed"', async () => {
+    const world = emptyWorld()
+    installFetch(world)
+    await apply({ emails: ['james@zabaca.com'], appLauncherVisible: true })
+    capture()
+    const out = await apply({ emails: ['james@zabaca.com'], appLauncherVisible: false })
+    console.log = realLog
+
+    expect(out.changed).toBe(true)
+    expect(printed.find((l) => l.includes('Converged Access application'))).toContain(
+      'app_launcher_visible',
+    )
+  })
+})
+
+describe('what the apply reports as changed about the application', () => {
+  const live = {
+    name: 'app',
+    domain: 'app.example.com',
+    type: 'self_hosted',
+    session_duration: '24h',
+    app_launcher_visible: true,
+    enable_binding_cookie: false,
+    http_only_cookie_attribute: true,
+  }
+
+  test('a body identical to the live application differs in nothing', () => {
+    expect(appDiffers(live, live)).toEqual([])
+  })
+
+  test('EVERY field the body writes is compared, not a chosen three', () => {
+    // The defect this replaces compared name, domain and session_duration and
+    // nothing else. `app_launcher_visible` is written on every apply from a
+    // default, so flipping it was a change being MADE and not reported — which
+    // is a different thing from drift being accepted, and the comment defending
+    // the old subset only ever argued the latter.
+    for (const [field, value] of [
+      ['name', 'other'],
+      ['domain', 'other.example.com'],
+      ['type', 'ssh'],
+      ['session_duration', '0s'],
+      ['app_launcher_visible', false],
+      ['enable_binding_cookie', true],
+      ['http_only_cookie_attribute', false],
+    ] as Array<[string, unknown]>) {
+      expect(appDiffers({ ...live, [field]: value }, live), field).toEqual([field])
+    }
+  })
+
+  test('the guard is not vacuous — it compares every key the body carries', () => {
+    // Without this, a comparison that looked at nothing would pass every case
+    // above by reporting `[]`, and the case above would only prove it reports
+    // `[]` for a match.
+    const desired = appBody({
+      name: 'app',
+      domain: 'app.example.com',
+      sessionDuration: '24h',
+      appLauncherVisible: true,
+      enableBindingCookie: false,
+      httpOnlyCookieAttribute: true,
+    })
+    expect(Object.keys(desired).toSorted()).toEqual(Object.keys(live).toSorted())
+  })
+
+  test('the domain is compared normalized, so a scheme is not a change', () => {
+    expect(appDiffers(live, { ...live, domain: 'https://App.Example.com/' })).toEqual([])
+  })
+
+  test('a field the live application does not carry at all reads as a difference', () => {
+    // An application created before a field existed answers without it. Once,
+    // that reports changed and the PUT settles it; reading absence as a match
+    // would mean the module never converged the field at all.
+    const { app_launcher_visible: _gone, ...older } = live
+    expect(appDiffers(live, older)).toEqual(['app_launcher_visible'])
+  })
+})
+
+describe('app_launcher_visible defaults to what omitting it has always meant', () => {
+  const base = {
+    accountId: 'acc',
+    name: 'Admin',
+    domain: 'app.example.com',
+    emails: ['james@zabaca.com'],
+    apiToken: { from: 'token', output: 'tokenValue' },
+  }
+
+  test('an instance declaring nothing leaves it as Cloudflare would', () => {
+    // A PUT is a full replace, so "omit the field" and "send Cloudflare's own
+    // default" are the same act and the module has no third option. Defaulting
+    // to `false` therefore made every migrating consumer's first apply a change
+    // — silently, since the field was not compared.
+    expect(cloudflareAccessModule.configSchema.parse(base).appLauncherVisible).toBe(true)
+  })
+
+  test('an instance that wants it hidden still says so', () => {
+    expect(
+      cloudflareAccessModule.configSchema.parse({ ...base, appLauncherVisible: false })
+        .appLauncherVisible,
+    ).toBe(false)
   })
 })
 

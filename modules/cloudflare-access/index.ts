@@ -206,7 +206,17 @@ const configSchema = z
      */
     serviceTokenPolicyName: z.string().min(1).optional(),
     /** Whether the application shows as a tile in the App Launcher. */
-    appLauncherVisible: z.boolean().default(false),
+    /**
+     * Whether the application shows as a tile in the App Launcher.
+     *
+     * DEFAULTS TO TRUE, which is Cloudflare's own default and therefore what
+     * omitting the field has always meant. A PUT is a full replace, so "omit
+     * it" and "send the default" are the same act and there is no third option
+     * — which is why defaulting it to `false` (as this did until 2026-08-23)
+     * made the first apply of every migrating consumer a change to live state.
+     * An instance that wants the tile hidden says so.
+     */
+    appLauncherVisible: z.boolean().default(true),
     /**
      * Cloudflare's binding cookie. Off, matching Cloudflare's own default and
      * the module this replaces: a machine caller should never be handed one.
@@ -634,6 +644,70 @@ export function appBody(config: {
 }
 
 /**
+ * Which fields of the body disagree with the live application. Pure; exported
+ * for tests.
+ *
+ * ⚠️ EVERY KEY THE BODY CARRIES, and that is the whole point rather than a
+ * detail. Until 2026-08-23 this comparison was three hand-listed fields — name,
+ * domain, session duration — defended by a comment arguing that the module
+ * "declares more of the application than it can read back reliably", so a
+ * re-apply "reports honestly without silently accepting drift in a field nobody
+ * looked at".
+ *
+ * That rationale is sound and it covers the wrong case. It defends not
+ * comparing a field THE DASHBOARD might have changed. It says nothing about a
+ * field THIS MODULE writes from its own default on every single apply — which
+ * is not drift being accepted, it is a change being made and not reported. A
+ * correct-sounding rationale covering the wrong case is harder to spot than no
+ * rationale, and this one hid `app_launcher_visible` flipping a live
+ * application while the apply printed `unchanged`.
+ *
+ * So the answer to "compare it or stop writing it" is COMPARE IT, and the
+ * comparison is derived from the body rather than listed beside it: add a field
+ * to `appBody` and it is compared, with no second place to remember.
+ */
+export function appDiffers(
+  desired: Record<string, unknown>,
+  live: Record<string, unknown>,
+): string[] {
+  return Object.keys(desired).filter((key) => {
+    const want = desired[key]
+    const have = live[key]
+    // The one field with an identity of its own: `https://Host/` and `host`
+    // are the same application, and reading them as different would make every
+    // apply a change.
+    if (key === 'domain') {
+      return normalizeDomain(String(want)) !== normalizeDomain(String(have ?? ''))
+    }
+    return JSON.stringify(want) !== JSON.stringify(have)
+  })
+}
+
+/**
+ * What the summary line says a person may sign in with. Pure; exported for
+ * tests.
+ *
+ * DECLARED AND UNDECLARED BOTH, because the question this answers is "can a
+ * person sign in", not "what did this instance declare". Reporting only the
+ * declared set meant that an instance declaring none — the recommended
+ * configuration when the organisation already offers what is needed, since
+ * declaring one converges nothing and needs write access over state every other
+ * application in the account shares — printed "nobody can sign in" three lines
+ * under its own report that two providers were offered and kept.
+ *
+ * The empty case still says nobody can, and that half is not incidental: an
+ * organisation really offering nothing must not be reassured by a fix aimed at
+ * a false alarm.
+ */
+export function signInWith(providers: {
+  declared: readonly string[]
+  undeclared: readonly string[]
+}): string {
+  const all = [...providers.declared, ...providers.undeclared]
+  return all.length > 0 ? all.join(', ') : '(nothing, so nobody can sign in)'
+}
+
+/**
  * The application this instance converges, and how it was recognised.
  *
  * TWO RULES, IN ORDER, and each is here because of a failure the other does not
@@ -941,21 +1015,18 @@ export const cloudflareAccessModule = defineModule({
     let app: CfApp
     let appChanged: boolean
     if (found) {
-      // ALWAYS a PUT, even when the compared fields agree. This module declares
-      // more of the application than it can read back reliably, and a converge
-      // that skips the write leaves whatever the dashboard did to the fields it
-      // does not compare. `changed` is computed from the compared subset
-      // instead, so a re-apply reports honestly without silently accepting
-      // drift in a field nobody looked at.
-      appChanged =
-        found.app.name !== config.name ||
-        normalizeDomain(found.app.domain) !== domain ||
-        (typeof found.app.session_duration === 'string' &&
-          found.app.session_duration !== config.sessionDuration)
+      // ALWAYS a PUT, even when everything agrees: a converge that skips the
+      // write leaves whatever the dashboard did to the fields this module owns.
+      // What it reports is now derived from the body it is about to send, so
+      // every field it writes is a field it compares — see `appDiffers` for why
+      // the previous three-field subset was worse than no comparison.
+      const differing = appDiffers(body, found.app as unknown as Record<string, unknown>)
+      appChanged = differing.length > 0
       app = await cf<CfApp>(token, 'PUT', `${account}/access/apps/${found.app.id}`, body)
       console.log(
         `  Converged Access application "${config.name}" on ${domain} (${app.id}, matched by ` +
-          `${found.by})`,
+          `${found.by})` +
+          (appChanged ? ` — changed ${differing.join(', ')}` : ''),
       )
     } else {
       app = await cf<CfApp>(token, 'POST', `${account}/access/apps`, body)
@@ -1119,7 +1190,7 @@ export const cloudflareAccessModule = defineModule({
     if (app.aud) console.log(`      audience     ${app.aud}`)
     if (config.emails.length > 0) {
       console.log(
-        `      sign in with ${identityProviders.join(', ') || '(nothing, so nobody can sign in)'}`,
+        `      sign in with ${signInWith({ declared: identityProviders, undeclared: undeclaredIdps })}`,
       )
       console.log(`      admits       ${config.emails.join(', ')}`)
     }
