@@ -65,7 +65,27 @@ export function renderProvisionScript(input: {
     )
   }
 
-  lines.push(input.script)
+  // The declared script runs in a SUBSHELL, so an `exit` inside it ends the
+  // script and not the payload.
+  //
+  // Consumers append a marker write after this string (see `markerWrite`) and
+  // rely on `set -e` to skip it when the script fails. The comment at those call
+  // sites — "only reached if everything above succeeded" — anticipates failure
+  // and not a success path that exits. A readiness poll ending in `exit 0` is a
+  // natural thing to write and it took the marker with it: on one consumer the
+  // provision re-ran on every apply for eight days, restarting a live service
+  // each time, while the module read exit code 0 and reported "provisioned".
+  // A missing marker is indistinguishable from a first run, so nothing noticed.
+  //
+  // `set -e` still aborts on a non-zero subshell, so a failing script records
+  // nothing exactly as before. What the subshell costs is that the script can no
+  // longer alter the payload's own environment — nothing follows it but the
+  // marker write, which needs nothing from it.
+  //
+  // An empty script is left unwrapped: `(` followed by `)` with nothing between
+  // them is a bash syntax error, and rendering something unparseable would turn
+  // a no-op into a failed apply.
+  lines.push(input.script.trim() === '' ? input.script : `(\n${input.script}\n)`)
   return `${lines.join('\n')}\n`
 }
 
