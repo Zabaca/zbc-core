@@ -1,6 +1,6 @@
 {
   "name": "cloudflare-access",
-  "description": "A Zero Trust application, its policy, and the service token a machine caller presents — the gate that lands with the tunnel it guards",
+  "description": "A Zero Trust application and the principals that may reach it — people by address on an allow policy, machines by service token on a Service Auth policy, each compared against its own idea of a match",
   "files": [
     {
       "path": "index.ts"
@@ -10,5 +10,5 @@
     "zod": "^3.24.0"
   },
   "secrets": [],
-  "instructions": "Reads the Cloudflare API through `../cloudflare-api`; needs an API token with Access: Apps and Policies write on the account. Declare it beside the tunnel that exposes the hostname: a hostname on the internet with no policy in front of it is an open door, which is the failure this module exists to make hard to reach. The service token's secret is an output — put it somewhere a caller can read it, not in the declaration. In COPY mode run `zbc add cloudflare-api` too."
+  "instructions": "Reads the Cloudflare API through `../cloudflare-api`; needs a token with Access: Apps and Policies write on the account, plus Access: Service Tokens write if `serviceTokenName` is declared and Access: Organizations / Identity Providers for the organisation-level fields. Declare it beside the tunnel that exposes the hostname: a hostname on the internet with no policy in front of it is an open door, which is the failure this module exists to make hard to reach. THREE FIELDS ARE ORGANISATION-LEVEL, not per-application — `teamDomain`, `orgName` and `identityProviders` converge the Zero Trust organisation shared by every Access application in the account; undeclared identity providers are reported and never removed, and declaring none converges none. `emails: []` plus `serviceTokenName` is the machine-only shape (say `sessionDuration: '0s'`, so no cookie is ever issued); `emails: [...]` plus `identityProviders: ['onetimepin']` is the human shape. A minted service token's secret is returned exactly once, on the apply that creates it — put it somewhere a caller can read it, not in the declaration. In COPY mode run `zbc add cloudflare-api` too."
 }
