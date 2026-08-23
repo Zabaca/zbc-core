@@ -220,6 +220,62 @@ async function ensureDestinationVerified(
   )
 }
 
+/** Recorded in outputs when the API carried no status for a record. */
+const UNREPORTED = 'unreported'
+
+/** One record as the Sending API returned it, plus how it should be labelled. */
+export interface SendingDnsReading {
+  /** `MX cf-bounce.example.com` — what a warning prints. */
+  key: string
+  /** The status Cloudflare reported, or `null` when it reported none. */
+  status: string | null
+}
+
+/**
+ * Read one Sending DNS record.
+ *
+ * The API is beta and its field names have moved, so this reads defensively —
+ * but the defensiveness stops at the LABEL. `type` and `name` fall back to
+ * placeholders because a wrong guess there only mislabels a line. `status` does
+ * not fall back at all: it returns `null` when the API carried none, because the
+ * previous `?? 'unknown'` produced a string the caller then compared against
+ * active|verified|locked, failed, and printed as `Sending DNS pending`.
+ *
+ * That turned "I could not find the field" into a claim about the customer's
+ * DNS. On one zone it fired on all four records — MX, SPF, DKIM, DMARC — every
+ * apply, while every record resolved correctly and the domain published
+ * `p=reject`, under which unaligned mail is refused rather than delivered. Mail
+ * was flowing the whole time. Absence and failure are different answers and only
+ * one of them is about DNS.
+ */
+export function readSendingDnsRecord(
+  record: Record<string, unknown>,
+  domain: string,
+): SendingDnsReading {
+  const reported = record.status ?? record.state
+  return {
+    key: `${String(record.type ?? 'record')} ${String(record.name ?? domain)}`,
+    status: reported === undefined || reported === null ? null : String(reported),
+  }
+}
+
+/** A status Cloudflare reports for a record that is live and serving. */
+const LIVE = new Set(['active', 'verified', 'locked'])
+
+export interface SendingDnsVerdict {
+  /** Reported as something other than live. A real warning. */
+  pending: SendingDnsReading[]
+  /** Carried no status. The module's blind spot, not a fact about the zone. */
+  unreported: SendingDnsReading[]
+}
+
+export function classifySendingDns(readings: SendingDnsReading[]): SendingDnsVerdict {
+  return {
+    pending: readings.filter((r) => r.status !== null && !LIVE.has(r.status)),
+    unreported: readings.filter((r) => r.status === null),
+  }
+}
+
 export const cloudflareEmailModule = defineModule({
   name: 'cloudflare-email',
   configSchema: z.object({
@@ -286,13 +342,18 @@ export const cloudflareEmailModule = defineModule({
           ? (dns as Array<Record<string, unknown>>)
           : (((dns as Record<string, unknown>)?.['records'] as Array<Record<string, unknown>>) ??
             [])
-        for (const r of records) {
-          const key = `${String(r.type ?? 'record')} ${String(r.name ?? domain)}`
-          const status = String(r.status ?? r.state ?? 'unknown')
-          dnsStatus[key] = status
-          if (status !== 'active' && status !== 'verified' && status !== 'locked') {
-            console.log(`  ⚠ Sending DNS pending: ${key} → ${status}`)
-          }
+        const readings = records.map((r) => readSendingDnsRecord(r, domain))
+        const verdict = classifySendingDns(readings)
+        for (const r of readings) dnsStatus[r.key] = r.status ?? UNREPORTED
+        for (const r of verdict.pending) {
+          console.log(`  ⚠ Sending DNS pending: ${r.key} → ${r.status}`)
+        }
+        if (verdict.unreported.length > 0) {
+          // Said once, and not as a warning: the records may be perfectly fine.
+          console.log(
+            `  Sending DNS: the API reported no status for ${verdict.unreported.length} record(s) ` +
+              `— not a claim about the zone; check them with dig if in doubt`,
+          )
         }
       } catch (err) {
         console.log(`  ⚠ Could not read sending DNS status: ${(err as Error).message}`)
@@ -421,7 +482,7 @@ export const cloudflareEmailModule = defineModule({
     }
 
     const pending = Object.entries(dnsStatus).filter(
-      ([, s]) => s !== 'active' && s !== 'verified' && s !== 'locked',
+      ([, s]) => s !== UNREPORTED && s !== 'active' && s !== 'verified' && s !== 'locked',
     )
     if (pending.length > 0) {
       console.log(
