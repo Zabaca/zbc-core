@@ -128,6 +128,34 @@ function fly(
 /** Read `app = "name"` out of the package's fly.toml. The app name belongs to
  *  the package's own topology file; `appName` in config only overrides it (the
  *  per-PR preview case, mirroring the cloudflare module's `workerName`). */
+/** Did `fly deploy` say, in its own words, that machines reached a good state?
+ *
+ *  Exit 0 is not the signal — flyctl prints its build and then exits 0 on paths
+ *  where nothing converged, which is what the caller's guard exists to catch.
+ *  The vocabulary differs by path, and the guard originally knew only the
+ *  first-launch half:
+ *
+ *    launching a new machine  -> "Finished launching new machines"
+ *    a machine-less group     -> "No machines in group"
+ *    non-rolling update       -> "update finished: success"
+ *    ROLLING update           -> "✔ Machine <id> is now in a good state"
+ *
+ *  The last line is the one that was missing, and it is the line every deploy
+ *  after the first prints. zbc-walgit was launched by hand, so CI's first run
+ *  against it took the rolling path and the guard failed a deploy that had in
+ *  fact converged (run 32881480843, 2026-08-25). A false red on a healthy
+ *  deploy costs the guard its credibility as surely as a false green does.
+ *
+ *  "reached stopped state" is NOT convergence and is deliberately not matched:
+ *  flyctl prints it for an auto-stopped machine on its way to a good state, and
+ *  also for one that stopped because it died. Only the good-state line settles it.
+ */
+export function machinesConverged(out: string): boolean {
+  return /(update finished: success|Finished launching new machines|No machines? in group|Machine \w+ is now in a good state)/.test(
+    out,
+  )
+}
+
 function appNameFromFlyToml(workdir: string): string | undefined {
   const tomlPath = path.join(workdir, 'fly.toml')
   if (!fs.existsSync(tomlPath)) return undefined
@@ -279,9 +307,7 @@ export const flyModule = defineModule({
 
     // Success-theater guard, same lesson as the cloudflare module: require a
     // confirmation that machines actually converged rather than trusting exit 0.
-    if (
-      !/(update finished: success|Finished launching new machines|No machines? in group)/.test(out)
-    ) {
+    if (!machinesConverged(out)) {
       throw new Error(
         `fly deploy exited 0 but printed no machine-convergence confirmation:\n${out}`,
       )
