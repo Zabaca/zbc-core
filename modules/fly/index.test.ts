@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { machinesConverged } from './index'
+import { machinesConverged, resolveFlyValue } from './index'
 
 /**
  * The four sentences flyctl uses to say "the machines are up".
@@ -46,5 +46,64 @@ Visit your newly deployed app at https://zbc-walgit.fly.dev/`),
     // Printed both by an auto-stopped machine on its way to a good state and
     // by one that stopped because it died. Only the good-state line settles it.
     expect(machinesConverged('> Machine 28792d7b453948 reached stopped state')).toBe(false)
+  })
+})
+
+/**
+ * The four shapes a `flySecrets` entry can take.
+ *
+ * The alias form exists because an app's env var name and the secrets.yaml key
+ * holding its value are set by different people: the app declares what it
+ * reads, and the environment decides what a credential is called. walgit reads
+ * `WALGIT_S3_ACCESS_KEY_ID`; the R2 credential it needs is filed under
+ * `WAREHOUSE_R2_ACCESS_KEY_ID`, because Cloudflare derives one S3 credential
+ * per API token and both apps share the account's. Without the alias the only
+ * way to bridge those is a second copy of the credential under a second name —
+ * which stays correct exactly until someone rotates one of them.
+ */
+describe('resolveFlyValue', () => {
+  const ctx = {
+    secrets: { WAREHOUSE_R2_ACCESS_KEY_ID: 'akid-123', PLAIN: 'plain-value' },
+    imports: { 'walgit-wal': { bucketName: 'zbc-walgit-wal' } },
+  }
+
+  test('a plain name takes the secret and its own spelling', () => {
+    expect(resolveFlyValue('PLAIN', ctx, 'flySecrets')).toEqual({
+      name: 'PLAIN',
+      value: 'plain-value',
+    })
+  })
+
+  test('an alias exposes one secret under a different env var name', () => {
+    expect(
+      resolveFlyValue(
+        { name: 'WALGIT_S3_ACCESS_KEY_ID', secret: 'WAREHOUSE_R2_ACCESS_KEY_ID' },
+        ctx,
+        'flySecrets',
+      ),
+    ).toEqual({ name: 'WALGIT_S3_ACCESS_KEY_ID', value: 'akid-123' })
+  })
+
+  test('an alias to a missing secret names both halves', () => {
+    // The message has to say which env var wanted it AND which key was looked
+    // up: with an alias those are different strings, and an error naming only
+    // one sends the reader to the wrong file.
+    expect(() =>
+      resolveFlyValue({ name: 'WALGIT_S3_ACCESS_KEY_ID', secret: 'NOPE' }, ctx, 'flySecrets'),
+    ).toThrow(/WALGIT_S3_ACCESS_KEY_ID.*NOPE/)
+  })
+
+  test('a literal and an import still resolve', () => {
+    expect(resolveFlyValue({ name: 'ENDPOINT', value: 'https://x' }, ctx, 'flySecrets')).toEqual({
+      name: 'ENDPOINT',
+      value: 'https://x',
+    })
+    expect(
+      resolveFlyValue(
+        { name: 'WALGIT_S3_BUCKET', from: 'walgit-wal', output: 'bucketName' },
+        ctx,
+        'flySecrets',
+      ),
+    ).toEqual({ name: 'WALGIT_S3_BUCKET', value: 'zbc-walgit-wal' })
   })
 })

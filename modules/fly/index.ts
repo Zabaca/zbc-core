@@ -58,12 +58,27 @@ const flyValueSchema = z.union([
     /** Which output of that instance to read. */
     output: z.string(),
   }),
+  z.object({
+    /** Env var name inside the app. */
+    name: z.string(),
+    /**
+     * A key in this environment's secrets.yaml, exposed under `name`.
+     *
+     * The plain-string form already reads a secret, but it forces the app's
+     * env var to be spelled exactly like the secret. An app whose interface
+     * says `WALGIT_S3_ACCESS_KEY_ID` cannot then read a credential filed as
+     * `WAREHOUSE_R2_ACCESS_KEY_ID` — and the alternative is a second copy of
+     * the same credential under a second name, which is one more thing to
+     * forget when it rotates.
+     */
+    secret: z.string(),
+  }),
 ])
 
 type FlyValueEntry = z.infer<typeof flyValueSchema>
 
 /** Resolve a flySecrets entry to its `{ name, value }` pair. */
-function resolveFlyValue(
+export function resolveFlyValue(
   entry: FlyValueEntry,
   ctx: { secrets: Record<string, string>; imports: Record<string, unknown> },
   fieldName: string,
@@ -80,6 +95,17 @@ function resolveFlyValue(
 
   if ('value' in entry) {
     return { name: entry.name, value: entry.value }
+  }
+
+  if ('secret' in entry) {
+    const value = ctx.secrets[entry.secret]
+    if (!value) {
+      throw new Error(
+        `${fieldName} entry "${entry.name}" reads secret "${entry.secret}", ` +
+          "which is missing from this environment's secrets.yaml",
+      )
+    }
+    return { name: entry.name, value }
   }
 
   const instanceOutputs = ctx.imports[entry.from]
@@ -187,7 +213,9 @@ export const flyModule = defineModule({
     /**
      * App secrets, staged before deploy. Each entry is either a plain name (a
      * key in this environment's secrets.yaml), `{ name, value }` for a literal,
-     * or `{ name, from, output }` to pull from an imported instance's outputs.
+     * `{ name, secret }` to expose a secrets.yaml key under a different env var
+     * name, or `{ name, from, output }` to pull from an imported instance's
+     * outputs.
      */
     flySecrets: z.array(flyValueSchema).default([]),
     /**
