@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { machinesConverged, resolveFlyValue } from './index'
+import { certsToRequest, machinesConverged, resolveFlyValue } from './index'
 
 /**
  * The four sentences flyctl uses to say "the machines are up".
@@ -105,5 +105,37 @@ describe('resolveFlyValue', () => {
         'flySecrets',
       ),
     ).toEqual({ name: 'WALGIT_S3_BUCKET', value: 'zbc-walgit-wal' })
+  })
+})
+
+/**
+ * Real `fly certs list` output. The header row matters: its first field is
+ * "Host", which must not be mistaken for a hostname that already has a
+ * certificate — a made-up sample without one would let that bug through.
+ */
+const CERTS_LIST = `Host                    Added                    Status
+git.zabaca.com          2026-08-28T22:00:00Z     Ready
+old.zabaca.com          2026-01-02T10:00:00Z     Ready
+`
+
+describe('certsToRequest', () => {
+  test('asks only for hostnames the app does not already have', () => {
+    expect(certsToRequest(CERTS_LIST, ['git.zabaca.com'])).toEqual([])
+    expect(certsToRequest(CERTS_LIST, ['new.zabaca.com'])).toEqual(['new.zabaca.com'])
+    expect(certsToRequest(CERTS_LIST, ['git.zabaca.com', 'new.zabaca.com'])).toEqual([
+      'new.zabaca.com',
+    ])
+  })
+
+  test('an empty list asks for everything', () => {
+    // A brand-new app: flyctl prints a header and nothing else.
+    expect(certsToRequest('Host Added Status\n', ['git.zabaca.com'])).toEqual(['git.zabaca.com'])
+    expect(certsToRequest('', ['git.zabaca.com'])).toEqual(['git.zabaca.com'])
+  })
+
+  test('a longer hostname containing a listed one is still requested', () => {
+    // Substring matching would skip this and leave it without a certificate,
+    // which no error anywhere would report.
+    expect(certsToRequest(CERTS_LIST, ['www.git.zabaca.com'])).toEqual(['www.git.zabaca.com'])
   })
 })

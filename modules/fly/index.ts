@@ -182,6 +182,29 @@ export function machinesConverged(out: string): boolean {
   )
 }
 
+/**
+ * Which of `wanted` has no certificate yet, given `fly certs list` output.
+ *
+ * Pure, and separated from apply because the cost of getting it wrong is
+ * asymmetric and invisible: `fly certs add` on a hostname that already has a
+ * certificate EXITS NON-ZERO, so a hostname wrongly judged absent fails the
+ * whole apply, while one wrongly judged present leaves the app serving a
+ * default certificate that every client rejects by name.
+ *
+ * Matching is on the first whitespace-delimited field of each line, never a
+ * substring: `git.zabaca.com` appears inside `www.git.zabaca.com`, and a
+ * substring test would skip a certificate that was never requested.
+ */
+export function certsToRequest(listOutput: string, wanted: string[]): string[] {
+  const present = new Set(
+    listOutput
+      .split('\n')
+      .map((line) => line.trim().split(/\s+/)[0])
+      .filter(Boolean),
+  )
+  return wanted.filter((hostname) => !present.has(hostname))
+}
+
 function appNameFromFlyToml(workdir: string): string | undefined {
   const tomlPath = path.join(workdir, 'fly.toml')
   if (!fs.existsSync(tomlPath)) return undefined
@@ -234,6 +257,16 @@ export const flyModule = defineModule({
      * for a builder machine to spin up.
      */
     localBuild: z.boolean().default(false),
+    /**
+     * Custom hostnames Fly should hold a TLS certificate for, e.g.
+     * `git.zabaca.com`. Each is requested once and left alone thereafter.
+     *
+     * The DNS record for the hostname must already point at this app, or Fly
+     * has nothing to validate against and the certificate sits pending — so
+     * the instance declaring a cert should `imports` whatever manages that
+     * record, to order the two within one apply.
+     */
+    certs: z.array(z.string()).default([]),
     /** Destroy+recreate the whole app on every apply (preview environments). */
     ephemeral: z.boolean().default(false),
   }),
@@ -291,7 +324,23 @@ export const flyModule = defineModule({
       fly(workdir, ['ips', 'allocate-v6', '-a', appName], env)
     }
 
-    // 3. Optional local build. Inherit stdio so build output streams.
+    // 3. Custom hostname certificates. Requested before the deploy rather than
+    //    after, because issuance is asynchronous on Fly's side and a deploy can
+    //    take minutes — asking first lets validation run during it.
+    //
+    //    `fly certs add` on a hostname that already has a certificate is an
+    //    error, not a no-op, so this lists first and matches whole lines: a
+    //    substring test would see `git.zabaca.com` inside `www.git.zabaca.com`
+    //    and skip a certificate that was never requested.
+    if (config.certs.length > 0) {
+      const listed = fly(workdir, ['certs', 'list', '-a', appName], env).out
+      for (const hostname of certsToRequest(listed, config.certs)) {
+        console.log(`  Requesting certificate for ${hostname}`)
+        fly(workdir, ['certs', 'add', hostname, '-a', appName], env)
+      }
+    }
+
+    // 4. Optional local build. Inherit stdio so build output streams.
     if (config.build) {
       const buildCwd = path.resolve(ctx.projectRoot, config.build.cwd ?? config.workdir)
       console.log(
@@ -300,11 +349,11 @@ export const flyModule = defineModule({
       execSync(config.build.command, { cwd: buildCwd, stdio: 'inherit', env })
     }
 
-    // 4. Resolve every secret BEFORE staging so a bad reference fails fast,
+    // 5. Resolve every secret BEFORE staging so a bad reference fails fast,
     //    without leaving a half-configured app. `resolveFlyValue` is pure.
     const resolved = config.flySecrets.map((entry) => resolveFlyValue(entry, ctx, 'flySecrets'))
 
-    // 5. Stage secrets. `--stage` withholds the deployment that `fly secrets
+    // 6. Stage secrets. `--stage` withholds the deployment that `fly secrets
     //    set` would otherwise trigger; step 6 picks them up. Values go on the
     //    command line as NAME=VALUE — flyctl offers no stdin form — so they are
     //    visible to a local process listing, though never logged here.
@@ -324,7 +373,7 @@ export const flyModule = defineModule({
       console.log(`  Staged secrets: ${resolved.map((s) => s.name).join(', ')}`)
     }
 
-    // 6. Deploy.
+    // 7. Deploy.
     const deployArgs = ['deploy', '-a', appName, '--yes']
     if (!config.highAvailability) deployArgs.push('--ha=false')
     if (config.localBuild) deployArgs.push('--local-only')
@@ -341,7 +390,7 @@ export const flyModule = defineModule({
       )
     }
 
-    // 7. Read the IPs back for outputs — dependents need the address, and after
+    // 8. Read the IPs back for outputs — dependents need the address, and after
     //    step 2 it is whatever Fly actually holds, not what we asked for.
     const finalIps = fly(workdir, ['ips', 'list', '-a', appName], env)
     const v4 = finalIps.out.match(/\bv4\s*│\s*([0-9.]+)/)?.[1] ?? ''
