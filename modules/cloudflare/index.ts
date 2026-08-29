@@ -107,8 +107,9 @@ export function routeUrl(routes: string[]): string {
  * A worker secret/var entry: a plain name (resolved from this environment's
  * secrets.yaml), a `{ name, value }` literal (vars that are per-instance
  * config rather than secrets — e.g. DEFAULT_FROM — so a generic wrangler.jsonc
- * needs no editing), or a `{ name, from, output }` reference into an imported
- * instance's outputs (`ctx.imports[from][output]`).
+ * needs no editing), a `{ name, from, output }` reference into an imported
+ * instance's outputs (`ctx.imports[from][output]`), or a `{ name, secret }`
+ * pair that exposes a secrets.yaml key under a different env var name.
  */
 const workerValueSchema = z.union([
   z.string(),
@@ -125,6 +126,21 @@ const workerValueSchema = z.union([
     from: z.string(),
     /** Which output of that instance to read. */
     output: z.string(),
+  }),
+  z.object({
+    /** Env var name inside the Worker. */
+    name: z.string(),
+    /**
+     * A key in this environment's secrets.yaml, exposed under `name`.
+     *
+     * The plain-string form already reads a secret, but it forces the Worker's
+     * env var to be spelled exactly like the secret. An app whose interface
+     * says `WALGIT_S3_ACCESS_KEY_ID` cannot then read a credential filed as
+     * `WAREHOUSE_R2_ACCESS_KEY_ID` — and the alternative is a second copy of
+     * the same credential under a second name, which is one more thing to
+     * forget when it rotates. Same form, same reason, as the `fly` module's.
+     */
+    secret: z.string(),
   }),
 ])
 
@@ -148,6 +164,16 @@ function resolveWorkerValue(
 
   if ('value' in entry) {
     return { name: entry.name, value: entry.value }
+  }
+
+  if ('secret' in entry) {
+    const value = ctx.secrets[entry.secret]
+    if (!value) {
+      throw new Error(
+        `${fieldName} entry "${entry.name}" references secret "${entry.secret}", which is missing from this environment's secrets.yaml`,
+      )
+    }
+    return { name: entry.name, value }
   }
 
   const instanceOutputs = ctx.imports[entry.from]
@@ -350,8 +376,10 @@ export const cloudflareModule = defineModule({
     /**
      * Worker secrets to push after deploy. Each entry is either a plain name
      * — a key in this environment's secrets.yaml, becoming a Worker secret
-     * binding of the same name (read at runtime as `env.<NAME>`) — or a
-     * `{ name, from, output }` reference into an imported instance's outputs.
+     * binding of the same name (read at runtime as `env.<NAME>`) — a
+     * `{ name, secret }` pair exposing a secrets.yaml key under a different
+     * name, or a `{ name, from, output }` reference into an imported
+     * instance's outputs.
      * Pushed via `wrangler secret put` with the value piped through stdin.
      */
     workerSecrets: z.array(workerValueSchema).default([]),
