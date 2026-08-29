@@ -50,6 +50,45 @@ export async function waitUntilReachable(
   }
 }
 
+/**
+ * `@libsql/client` and `drizzle-orm` are turso's OPTIONAL dependencies, and this
+ * is the seam that keeps them optional.
+ *
+ * Only the `migrationsDir` branch of `apply` touches them, so `registry.json`
+ * lists them under `optionalDependencies` and `zbc add turso` does not pull
+ * drizzle into a repository that has no migrations to run. A plain
+ * `await import('@libsql/client')` contradicts that: it is a module TypeScript
+ * must resolve at compile time, so every consumer that took the module at its
+ * word and skipped them compiles three unresolvable imports — `modules/` is the
+ * tree they vendor, so the errors are theirs, not just ours.
+ *
+ * Going through a specifier the compiler cannot fold to a literal moves that
+ * resolution to runtime, where the branch has already established the package is
+ * installed. The types below are the price: the surface used is written out here
+ * rather than read off the real package, so it has to be kept honest by hand.
+ * Both are small and neither is on a version we pin.
+ */
+const importOptional = <T>(specifier: string): Promise<T> => import(specifier) as Promise<T>
+
+/** The one function this module calls in `@libsql/client`, and the two it calls on the result. */
+interface LibsqlClientModule {
+  createClient(config: { url: string; authToken?: string }): LibsqlClient
+}
+
+interface LibsqlClient {
+  execute(sql: string): Promise<unknown>
+  close(): void
+}
+
+/** The handle is opaque here — it is created and then handed straight to `migrate`. */
+interface DrizzleLibsqlModule {
+  drizzle(client: LibsqlClient): unknown
+}
+
+interface DrizzleMigratorModule {
+  migrate(db: unknown, config: { migrationsFolder: string }): Promise<void>
+}
+
 export const tursoModule = defineModule({
   name: 'turso',
   configSchema: z.object({
@@ -144,9 +183,10 @@ export const tursoModule = defineModule({
 
     if (config.migrationsDir) {
       const { resolve } = await import('node:path')
-      const { createClient: createLibsqlClient } = await import('@libsql/client')
-      const { drizzle } = await import('drizzle-orm/libsql')
-      const { migrate } = await import('drizzle-orm/libsql/migrator')
+      const { createClient: createLibsqlClient } =
+        await importOptional<LibsqlClientModule>('@libsql/client')
+      const { drizzle } = await importOptional<DrizzleLibsqlModule>('drizzle-orm/libsql')
+      const { migrate } = await importOptional<DrizzleMigratorModule>('drizzle-orm/libsql/migrator')
 
       const folder = resolve(ctx.projectRoot, config.migrationsDir)
       const migrationClient = createLibsqlClient({
