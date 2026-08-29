@@ -87,6 +87,23 @@ const buildSchema = z.object({
 })
 
 /**
+ * The origin a route pattern answers on, for `deployUrl` when there is no
+ * workers.dev URL to report.
+ *
+ * Only a pattern whose host is a concrete hostname qualifies. A wildcard host
+ * (`*.example.com/*`) names a set rather than an address, and emitting
+ * `https://*.example.com` would hand a dependent a string that looks like a URL
+ * and resolves to nothing.
+ */
+export function routeUrl(routes: string[]): string {
+  for (const route of routes) {
+    const host = route.split('/')[0]
+    if (host && !host.includes('*') && host.includes('.')) return `https://${host}`
+  }
+  return ''
+}
+
+/**
  * A worker secret/var entry: a plain name (resolved from this environment's
  * secrets.yaml), a `{ name, value }` literal (vars that are per-instance
  * config rather than secrets — e.g. DEFAULT_FROM — so a generic wrangler.jsonc
@@ -380,6 +397,26 @@ export const cloudflareModule = defineModule({
      * `name` declared in wrangler.jsonc.
      */
     workerName: z.string().optional(),
+    /**
+     * Hostname patterns this worker answers, e.g. `zbc.zabaca.com/*`, emitted
+     * as `--route`. The DNS record for the hostname is NOT created here: it
+     * belongs to a `cloudflare-zone` instance, and this instance should import
+     * that one so the record exists before the route is claimed.
+     *
+     * It lives in instance config rather than wrangler.jsonc, and that is the
+     * whole point. Preview PRs deploy the SAME wrangler.jsonc under a
+     * per-PR `workerName`, so a route declared in the file would be claimed by
+     * every preview deploy too — and a Cloudflare route is unique per zone, so
+     * the most recently deployed PR would take production's traffic, silently
+     * and with no error anywhere. A preview instance omits `routes` and keeps
+     * its `*.workers.dev` URL.
+     *
+     * Deliberately a route, not a wrangler "custom domain": a custom domain
+     * has wrangler create its own managed DNS record, which the zone module
+     * would then read as undeclared drift, and the two would argue on every
+     * apply.
+     */
+    routes: z.array(z.string()).default([]),
   }),
   outputs: z.object({
     deployUrl: z.string(),
@@ -465,9 +502,10 @@ export const cloudflareModule = defineModule({
     if (config.wranglerEnv) deployArgs.push('--env', config.wranglerEnv)
     if (config.workerName) deployArgs.push('--name', config.workerName)
     if (config.immediateContainerRollout) deployArgs.push('--containers-rollout', 'immediate')
+    for (const route of config.routes) deployArgs.push('--route', route)
     for (const { name, value } of resolvedVars) deployArgs.push('--var', `${name}:${value}`)
     console.log(
-      `  Deploying via wrangler (in ${config.workdir})${config.wranglerEnv ? ` [env: ${config.wranglerEnv}]` : ''}${config.workerName ? ` [name: ${config.workerName}]` : ''}${config.immediateContainerRollout ? ' [immediate container rollout]' : ''}${resolvedVars.length ? ` [vars: ${resolvedVars.map((v) => v.name).join(', ')}]` : ''}${resolvedR2.length ? ` [r2: ${resolvedR2.map((b) => `${b.binding}→${b.bucketName}`).join(', ')}]` : ''}`,
+      `  Deploying via wrangler (in ${config.workdir})${config.wranglerEnv ? ` [env: ${config.wranglerEnv}]` : ''}${config.workerName ? ` [name: ${config.workerName}]` : ''}${config.immediateContainerRollout ? ' [immediate container rollout]' : ''}${config.routes.length ? ` [routes: ${config.routes.join(', ')}]` : ''}${resolvedVars.length ? ` [vars: ${resolvedVars.map((v) => v.name).join(', ')}]` : ''}${resolvedR2.length ? ` [r2: ${resolvedR2.map((b) => `${b.binding}→${b.bucketName}`).join(', ')}]` : ''}`,
     )
     let out: string
     try {
@@ -485,8 +523,13 @@ export const cloudflareModule = defineModule({
       )
     }
     const workerName = deployedMatch[1]!
+    // A routed worker has no workers.dev URL to print: wrangler DISABLES the
+    // subdomain when routes are configured and `workers_dev` is not explicitly
+    // true, and prints the routes instead. Falling back to the first route
+    // keeps `deployUrl` meaning "where this worker answers" rather than going
+    // empty the moment an app gets a real hostname.
     const urlMatch = out.match(/https:\/\/[^\s"',]+\.workers\.dev[^\s"',]*/)
-    const deployUrl = urlMatch?.[0] ?? ''
+    const deployUrl = urlMatch?.[0] ?? routeUrl(config.routes)
     console.log(`  Deployed: ${deployUrl || '(URL not parsed — see wrangler output)'}`)
 
     // 4. Push Worker secrets (after deploy: the script must exist first).

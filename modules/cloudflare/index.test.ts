@@ -3,7 +3,7 @@ import { execSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { cloudflareModule } from './index'
+import { cloudflareModule, routeUrl } from './index'
 
 /**
  * End-to-end resolver tests for the cloudflare module.
@@ -274,4 +274,22 @@ test('stub wrangler is executable on this platform', () => {
   } finally {
     fs.rmSync(probe, { recursive: true, force: true })
   }
+})
+
+describe('routeUrl', () => {
+  test('names the origin a concrete route answers on', () => {
+    expect(routeUrl(['zbc.zabaca.com/*'])).toBe('https://zbc.zabaca.com')
+    expect(routeUrl(['zbc.zabaca.com/api/*'])).toBe('https://zbc.zabaca.com')
+  })
+
+  test('a wildcard host is a set, not an address', () => {
+    // `https://*.example.com` looks like a URL and resolves to nothing, so a
+    // dependent reading deployUrl would get a string it cannot fetch.
+    expect(routeUrl(['*.example.com/*'])).toBe('')
+    expect(routeUrl(['*.example.com/*', 'real.example.com/*'])).toBe('https://real.example.com')
+  })
+
+  test('no routes means no url, not a fabricated one', () => {
+    expect(routeUrl([])).toBe('')
+  })
 })
