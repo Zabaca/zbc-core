@@ -205,6 +205,25 @@ export function certsToRequest(listOutput: string, wanted: string[]): string[] {
   return wanted.filter((hostname) => !present.has(hostname))
 }
 
+/**
+ * Machines in the `app` process group, from `fly scale show` output.
+ *
+ * Returns undefined when the output cannot be read as a table — a flyctl
+ * version that reworded it, or a call that failed. Undefined means "do not
+ * scale", never "scale to zero": guessing a count from output this did not
+ * understand would destroy machines, and the safe direction when the evidence
+ * is unreadable is to leave the app alone and let the next apply try again.
+ */
+export function machineCount(scaleShowOutput: string): number | undefined {
+  for (const line of scaleShowOutput.split('\n')) {
+    const cells = line.split('│').map((cell) => cell.trim())
+    if (cells.length < 2 || cells[0] !== 'app') continue
+    const count = Number(cells[1])
+    if (Number.isInteger(count) && count >= 0) return count
+  }
+  return undefined
+}
+
 function appNameFromFlyToml(workdir: string): string | undefined {
   const tomlPath = path.join(workdir, 'fly.toml')
   if (!fs.existsSync(tomlPath)) return undefined
@@ -397,6 +416,24 @@ export const flyModule = defineModule({
     const v6 = finalIps.out.match(/\bv6\s*│\s*([0-9a-fA-F:]+)/)?.[1] ?? ''
     const hostname = `${appName}.fly.dev`
     console.log(`  Deployed: ${hostname}${v4 ? ` (${v4})` : ''}`)
+
+    // 9. Machine count. This is NOT what `--ha` on the deploy above does:
+    //    flyctl's `--ha` provisions a spare only when it is FIRST launching an
+    //    app, and a deploy to an app that already exists keeps whatever count
+    //    it has. So `highAvailability: true` on a live app changed nothing and
+    //    said nothing — the deploy reported success either way, which is the
+    //    failure this module already learned to distrust once.
+    //
+    //    `fly scale count` is the converging form, and it runs AFTER the deploy
+    //    so a machine created here starts from the image just released rather
+    //    than the previous one.
+    const wanted = config.highAvailability ? 2 : 1
+    const shown = fly(workdir, ['scale', 'show', '-a', appName], env, { allowFailure: true })
+    const current = machineCount(shown.out)
+    if (current !== undefined && current !== wanted) {
+      console.log(`  Scaling machines: ${current} → ${wanted}`)
+      fly(workdir, ['scale', 'count', String(wanted), '-a', appName, '--yes'], env)
+    }
 
     return { appName, hostname, ipv4: v4, ipv6: v6 }
   },

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { certsToRequest, machinesConverged, resolveFlyValue } from './index'
+import { certsToRequest, machineCount, machinesConverged, resolveFlyValue } from './index'
 
 /**
  * The four sentences flyctl uses to say "the machines are up".
@@ -137,5 +137,31 @@ describe('certsToRequest', () => {
     // Substring matching would skip this and leave it without a certificate,
     // which no error anywhere would report.
     expect(certsToRequest(CERTS_LIST, ['www.git.zabaca.com'])).toEqual(['www.git.zabaca.com'])
+  })
+})
+
+/** Verbatim `fly scale show` output, box-drawing characters and all. */
+const SCALE_SHOW = `Groups
+ NAME │ COUNT │ KIND   │ CPUS │ MEMORY │ REGIONS
+ app  │ 1     │ shared │ 1    │ 512 MB │ sjc
+`
+
+describe('machineCount', () => {
+  test('reads the app process group count', () => {
+    expect(machineCount(SCALE_SHOW)).toBe(1)
+    expect(machineCount(SCALE_SHOW.replace('│ 1     │ shared', '│ 2     │ shared'))).toBe(2)
+  })
+
+  test('output it cannot read means do not scale, never scale to zero', () => {
+    // A flyctl that reworded the table, or a call that failed outright.
+    // Returning 0 here would destroy every machine the app has.
+    expect(machineCount('')).toBeUndefined()
+    expect(machineCount('Error: no access to this app\n')).toBeUndefined()
+    expect(machineCount('NAME COUNT KIND\napp 1 shared\n')).toBeUndefined()
+  })
+
+  test('a non-app process group is not mistaken for the app', () => {
+    const withWorker = SCALE_SHOW + ' worker │ 7     │ shared │ 1    │ 512 MB │ sjc\n'
+    expect(machineCount(withWorker)).toBe(1)
   })
 })
