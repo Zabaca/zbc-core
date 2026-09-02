@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { resolveOutput } from '../../src/context'
 
 // The parts of "converge the inside of a machine" that do not care how the
 // work is delivered: what to run, whether to run it, and how to decide that
@@ -93,6 +94,20 @@ export function renderProvisionScript(input: {
  * Reads `ENVVAR: "instance.field"` references out of another instance's
  * outputs. Outputs only exist during an apply, so this is the only way a
  * just-minted credential can reach a script without being written down.
+ *
+ * Only the dotted spelling is this function's own — `instance.field` is a
+ * flatter form than the `{ from, output }` every other module takes, and it is
+ * kept because it is what instance files already say. Once split, the lookup
+ * is the engine's `resolveOutput`, the same one behind `ctx.output`.
+ *
+ * `allowBlank`: an empty value is a real answer here. The authkey module mints
+ * only when there is a join to perform, and reports `''` otherwise —
+ * `shouldProvision` reads exactly that to decide whether an unchanged digest
+ * still has work.
+ *
+ * A non-string output is now an error rather than a `String(value)`. Exporting
+ * `TS_AUTHKEY=true` because a ref pointed at a boolean output is not a value
+ * any script wanted, and it reaches the guest looking exactly like one that was.
  */
 export function resolveVolatileEnv(
   spec: Record<string, string>,
@@ -104,21 +119,12 @@ export function resolveVolatileEnv(
     if (dot <= 0 || dot === ref.length - 1) {
       throw new Error(`volatileEnvFrom.${envVar}: "${ref}" is not of the form instance.field`)
     }
-    const instance = ref.slice(0, dot)
-    const field = ref.slice(dot + 1)
-    const source = imports[instance]
-    if (source === undefined || source === null || typeof source !== 'object') {
-      throw new Error(
-        `volatileEnvFrom.${envVar}: no imported instance named "${instance}" — add it to this instance's imports`,
-      )
-    }
-    const value = (source as Record<string, unknown>)[field]
-    if (value === undefined) {
-      throw new Error(
-        `volatileEnvFrom.${envVar}: instance "${instance}" has no output field "${field}"`,
-      )
-    }
-    out[envVar] = String(value)
+    out[envVar] = resolveOutput(
+      { from: ref.slice(0, dot), output: ref.slice(dot + 1) },
+      imports,
+      `volatileEnvFrom.${envVar}`,
+      { allowBlank: true },
+    )
   }
   return out
 }

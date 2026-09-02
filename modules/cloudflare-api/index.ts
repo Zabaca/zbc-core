@@ -1,6 +1,7 @@
 // The parts of "talk to the Cloudflare API" that no module should own twice:
-// the base URL, the envelope Cloudflare wraps every response in, and the rule
-// for reading a credential out of an imported instance's outputs.
+// the base URL, the envelope Cloudflare wraps every response in, and the two
+// names its modules call to read a credential out of an imported instance's
+// outputs (the rule itself is the engine's, in `../../src/context`).
 //
 // Extracted the way `provision-core` was extracted, and for the same reason its
 // header gives. `cloudflare-zone` wrote these first; `cloudflare-tunnel` needed
@@ -22,6 +23,8 @@
 // genuinely per-module part was naming which token scope was missing, and that
 // is `CfOptions.hints`. `c9s/src/cf.ts` is a fifth copy and stays: it lives in
 // a separate package and cannot import a template.
+
+import { resolveOutput } from '../../src/context'
 
 export const API = 'https://api.cloudflare.com/client/v4'
 
@@ -267,30 +270,23 @@ export function resolveApiToken(
  * one that says `apiToken` for the third entry of `serviceTokens` sends the
  * reader to the wrong line of an instance file.
  *
- * The parameter is typed loosely on purpose. A zod-inferred config marks both
- * halves optional in some spellings, and the checks have to run at runtime
- * regardless — a `from` naming an instance that is not imported is a real
- * failure mode and nothing in the type system is catching it here.
+ * Both are now one line over `resolveOutput` — the rule and its three messages
+ * live in `../../src/context`, and a module inside an `apply`/`destroy` should
+ * say `ctx.output(ref, field)` instead, which every Cloudflare module in core
+ * now does. These stay because they take a raw imports record rather than a
+ * context, which is the only thing a caller outside an apply has, and because
+ * removing an exported name from a vendored library breaks whoever wrote their
+ * own Cloudflare module against it.
+ *
+ * Prefer `ctx.output` where you have a context: during a `destroy` it is the
+ * call that can still answer. `cloudflare-tunnel`'s teardown read `ctx.imports`
+ * through here and reported "which is not in this instance's imports" about an
+ * instance that WAS imported — the engine simply had not applied it.
  */
 export function resolveRef(
   ref: { from?: string; output?: string },
   imports: Record<string, unknown>,
   field: string,
 ): string {
-  if (!ref.from || !ref.output) {
-    throw new Error(`${field} must name both an instance (\`from\`) and an output (\`output\`)`)
-  }
-  const outputs = imports[ref.from]
-  if (outputs === undefined) {
-    throw new Error(
-      `${field} references instance "${ref.from}", which is not in this instance's imports`,
-    )
-  }
-  const value = (outputs as Record<string, unknown> | null)?.[ref.output]
-  if (typeof value !== 'string' || value === '') {
-    throw new Error(
-      `${field} references output "${ref.output}" on instance "${ref.from}", which doesn't emit it`,
-    )
-  }
-  return value
+  return resolveOutput(ref, imports, field)
 }

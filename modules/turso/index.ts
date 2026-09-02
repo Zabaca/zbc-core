@@ -109,8 +109,7 @@ export const tursoModule = defineModule({
     authToken: z.string(),
   }),
   async apply(config, ctx) {
-    const apiToken = ctx.secrets['TURSO_API_TOKEN']
-    if (!apiToken) throw new Error('Missing secret: TURSO_API_TOKEN')
+    const apiToken = ctx.secret('TURSO_API_TOKEN')
 
     // Imported here rather than at the top of the file, the way the migration
     // dependencies below already are: a consumer that vendors zbc-core but
@@ -210,8 +209,7 @@ export const tursoModule = defineModule({
     }
   },
   async destroy(config, ctx) {
-    const apiToken = ctx.secrets['TURSO_API_TOKEN']
-    if (!apiToken) throw new Error('Missing secret: TURSO_API_TOKEN')
+    const apiToken = ctx.secret('TURSO_API_TOKEN')
 
     const { createClient } = await import('@tursodatabase/api')
     const turso = createClient({ org: config.orgName, token: apiToken })

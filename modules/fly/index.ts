@@ -3,12 +3,13 @@ import * as fs from 'node:fs'
 import { execSync, spawnSync } from 'node:child_process'
 import { z } from 'zod'
 import { defineModule } from '../../src/define-module'
+import { resolveOutput, resolveSecret } from '../../src/context'
 
 /**
  * fly — deploys a package to Fly.io via `fly deploy`.
  *
  * Same shape as the `cloudflare` module: a THIN orchestrator. `apply` runs on
- * the operator machine, reads the Fly credential from `ctx.secrets`, runs an
+ * the operator machine, reads the Fly credential through `ctx.secret`, runs an
  * optional local build, then shells `fly deploy` in the package's own
  * directory. The app TOPOLOGY (processes, services, ports, handlers, VM size,
  * regions, autostop/autostart) lives in that package's `fly.toml` — Fly is the
@@ -77,50 +78,34 @@ const flyValueSchema = z.union([
 
 type FlyValueEntry = z.infer<typeof flyValueSchema>
 
-/** Resolve a flySecrets entry to its `{ name, value }` pair. */
+/**
+ * Resolve a flySecrets entry to its `{ name, value }` pair.
+ *
+ * Takes the two raw fields rather than an `ApplyContext` — a full context is
+ * structurally one of these, and it keeps the helper callable with a literal.
+ * `resolveSecret`/`resolveOutput` are the same implementations `ctx.secret` and
+ * `ctx.output` are built from, so the failures read identically either way.
+ */
 export function resolveFlyValue(
   entry: FlyValueEntry,
   ctx: { secrets: Record<string, string>; imports: Record<string, unknown> },
   fieldName: string,
 ): { name: string; value: string } {
   if (typeof entry === 'string') {
-    const value = ctx.secrets[entry]
-    if (!value) {
-      throw new Error(
-        `${fieldName} references "${entry}" but it's missing from this environment's secrets.yaml`,
-      )
-    }
-    return { name: entry, value }
+    return { name: entry, value: resolveSecret(ctx.secrets, entry, { field: fieldName }) }
   }
 
   if ('value' in entry) {
     return { name: entry.name, value: entry.value }
   }
 
+  const field = `${fieldName} entry "${entry.name}"`
+
   if ('secret' in entry) {
-    const value = ctx.secrets[entry.secret]
-    if (!value) {
-      throw new Error(
-        `${fieldName} entry "${entry.name}" reads secret "${entry.secret}", ` +
-          "which is missing from this environment's secrets.yaml",
-      )
-    }
-    return { name: entry.name, value }
+    return { name: entry.name, value: resolveSecret(ctx.secrets, entry.secret, { field }) }
   }
 
-  const instanceOutputs = ctx.imports[entry.from]
-  if (!instanceOutputs) {
-    throw new Error(
-      `${fieldName} entry "${entry.name}" reads from instance "${entry.from}", which is not in this instance's imports`,
-    )
-  }
-  const value = (instanceOutputs as Record<string, unknown>)[entry.output]
-  if (value === undefined) {
-    throw new Error(
-      `${fieldName} entry "${entry.name}" reads output "${entry.output}" from instance "${entry.from}", which does not emit it`,
-    )
-  }
-  return { name: entry.name, value: String(value) }
+  return { name: entry.name, value: resolveOutput(entry, ctx.imports, field) }
 }
 
 /** Run flyctl, capturing BOTH streams — flyctl splits human output across them,
@@ -299,8 +284,7 @@ export const flyModule = defineModule({
     ipv6: z.string(),
   }),
   async apply(config, ctx) {
-    const token = ctx.secrets['FLY_API_TOKEN']
-    if (!token) throw new Error('Missing secret: FLY_API_TOKEN')
+    const token = ctx.secret('FLY_API_TOKEN')
 
     const env: NodeJS.ProcessEnv = { ...process.env, FLY_API_TOKEN: token }
     const workdir = path.resolve(ctx.projectRoot, config.workdir)
@@ -438,8 +422,7 @@ export const flyModule = defineModule({
     return { appName, hostname, ipv4: v4, ipv6: v6 }
   },
   async destroy(config, ctx) {
-    const token = ctx.secrets['FLY_API_TOKEN']
-    if (!token) throw new Error('Missing secret: FLY_API_TOKEN')
+    const token = ctx.secret('FLY_API_TOKEN')
     const env: NodeJS.ProcessEnv = { ...process.env, FLY_API_TOKEN: token }
     const workdir = path.resolve(ctx.projectRoot, config.workdir)
     const appName = config.appName ?? appNameFromFlyToml(workdir)

@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import { defineModule } from '../../src/define-module'
-import { cf, resolveApiToken, resolveRef } from '../cloudflare-api'
+import { cf } from '../cloudflare-api'
 
 // cloudflare-access — a Zero Trust application and the list of principals that
 // may reach it, as repo state instead of dashboard state.
@@ -814,14 +814,14 @@ export const cloudflareAccessModule = defineModule({
     changed: z.boolean(),
   }),
   async apply(config, ctx) {
-    const token = resolveApiToken(config.apiToken, ctx.imports)
+    const token = ctx.output(config.apiToken, 'apiToken')
     const account = `/accounts/${config.accountId}`
     const domain = normalizeDomain(config.domain)
 
     // Resolved before anything is called, so a service token instance that is
     // not imported fails while nothing has been touched.
     const referencedTokenIds = config.serviceTokens.map((ref, index) =>
-      resolveRef(ref, ctx.imports, `serviceTokens[${index}]`),
+      ctx.output(ref, `serviceTokens[${index}]`),
     )
 
     // 1. The organisation. Two fields off one endpoint, treated in OPPOSITE

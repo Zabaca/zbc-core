@@ -85,9 +85,7 @@ export const remoteProvisionModule = defineModule({
   apply: async (config, ctx) => {
     const env: Record<string, string> = { ...config.env }
     for (const [key, secretKey] of Object.entries(config.envSecrets)) {
-      const value = ctx.secrets[secretKey]
-      if (value === undefined) throw new Error(`secret "${secretKey}" not found in secrets.yaml`)
-      env[key] = value
+      env[key] = ctx.secret(secretKey, { allowBlank: true, field: `envSecrets.${key}` })
     }
 
     const volatileEnv = resolveVolatileEnv(config.volatileEnvFrom, ctx.imports)

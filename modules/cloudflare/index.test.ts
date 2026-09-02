@@ -108,6 +108,45 @@ async function runApply(opts: {
   return { result, error, calls: parseCalls(log) }
 }
 
+/** Run `destroy` against the same stubbed workdir; capture calls even on throw. */
+async function runDestroy(opts: {
+  config?: Record<string, unknown>
+  secrets?: Record<string, string>
+  bareSecrets?: Record<string, string>
+  imports?: Record<string, unknown>
+}): Promise<{ error?: Error; calls: WranglerCall[] }> {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-stub-'))
+  createdRoots.push(root)
+  const binDir = path.join(root, 'node_modules', '.bin')
+  fs.mkdirSync(binDir, { recursive: true })
+  const stubPath = path.join(binDir, 'wrangler')
+  fs.writeFileSync(stubPath, STUB_WRANGLER, { mode: 0o755 })
+  fs.chmodSync(stubPath, 0o755)
+
+  const logPath = path.join(root, 'calls.log')
+  process.env.STUB_LOG = logPath
+
+  const config = cloudflareModule.configSchema.parse({
+    workdir: '.',
+    accountId: 'acct-1',
+    ...opts.config,
+  })
+  const ctx = {
+    secrets: opts.bareSecrets ?? { CLOUDFLARE_API_TOKEN: 'cf-token', ...opts.secrets },
+    imports: opts.imports ?? {},
+    projectRoot: root,
+  }
+
+  let error: Error | undefined
+  try {
+    await cloudflareModule.destroy!(config, ctx)
+  } catch (e) {
+    error = e as Error
+  }
+  const log = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : ''
+  return { error, calls: parseCalls(log) }
+}
+
 const deployCall = (calls: WranglerCall[]) => calls.find((c) => c.argv[0] === 'deploy')
 const secretCalls = (calls: WranglerCall[]) =>
   calls.filter((c) => c.argv[0] === 'secret' && c.argv[1] === 'put')
@@ -291,5 +330,51 @@ describe('routeUrl', () => {
 
   test('no routes means no url, not a fabricated one', () => {
     expect(routeUrl([])).toBe('')
+  })
+})
+
+/**
+ * Teardown resolves its credential the same way `apply` does.
+ *
+ * It used to be twenty lines that could not: the engine handed `destroy` an
+ * empty `imports`, so the `apiToken` reference was wrapped in a swallowed catch
+ * and fell back to a `CLOUDFLARE_API_TOKEN` in secrets.yaml — a second copy at
+ * rest of a credential `cloudflare-token` mints fresh and never persists. The
+ * engine now applies the referenced instance on demand, so the reference is the
+ * answer and the fallback is gone.
+ */
+describe('cloudflare destroy — the same credential rule as apply', () => {
+  test('an apiToken reference is used, not secrets.yaml', async () => {
+    const { error, calls } = await runDestroy({
+      config: { apiToken: { from: 'deploy-token', output: 'tokenValue' } },
+      imports: { 'deploy-token': { tokenValue: 'minted-tok' } },
+      secrets: { CLOUDFLARE_API_TOKEN: 'stale-from-secrets' },
+    })
+    expect(error).toBeUndefined()
+    expect(calls[0]?.argv[0]).toBe('delete')
+    expect(calls[0]?.token).toBe('minted-tok')
+  })
+
+  test('an unresolvable apiToken reference fails by name — it no longer falls back', async () => {
+    const { error, calls } = await runDestroy({
+      config: { apiToken: { from: 'deploy-token', output: 'tokenValue' } },
+      imports: {},
+      secrets: { CLOUDFLARE_API_TOKEN: 'stale-from-secrets' },
+    })
+    expect(error?.message).toContain('deploy-token')
+    expect(error?.message).toContain('apiToken')
+    expect(calls).toHaveLength(0)
+  })
+
+  test('no apiToken config still reads secrets.yaml', async () => {
+    const { error, calls } = await runDestroy({})
+    expect(error).toBeUndefined()
+    expect(calls[0]?.token).toBe('cf-token')
+  })
+
+  test('no apiToken config and no secret names the secret, and deletes nothing', async () => {
+    const { error, calls } = await runDestroy({ bareSecrets: {} })
+    expect(error?.message).toContain('CLOUDFLARE_API_TOKEN')
+    expect(calls).toHaveLength(0)
   })
 })

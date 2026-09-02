@@ -1,4 +1,5 @@
 import type { z } from 'zod'
+import { ensureApplyContext } from './context'
 import type { ApplyFn, DestroyFn, ModuleDefinition, ModuleInstance, InstanceOptions } from './types'
 
 interface DefineModuleOptions<TConfig extends z.ZodType, TOutputs extends z.ZodType> {
@@ -16,8 +17,13 @@ export function defineModule<TConfig extends z.ZodType, TOutputs extends z.ZodTy
     name: opts.name,
     configSchema: opts.configSchema,
     outputsSchema: opts.outputs,
-    apply: opts.apply,
-    destroy: opts.destroy,
+    // The context is normalized HERE rather than in the engine, so a module
+    // body may assume `ctx.secret`/`ctx.output` exist whoever called it — the
+    // engine, another module's test, a consumer's script. A caller that
+    // already holds a full context (the destroy path's on-demand one) is
+    // passed through untouched.
+    apply: (config, ctx) => opts.apply(config, ensureApplyContext(ctx)),
+    destroy: opts.destroy && ((config, ctx) => opts.destroy!(config, ensureApplyContext(ctx))),
     instance(instanceOpts: InstanceOptions<TConfig>): ModuleInstance<TOutputs> {
       return {
         name: instanceOpts.name,

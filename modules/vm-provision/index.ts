@@ -44,6 +44,15 @@ export interface VmOutputs {
   target?: IncusTarget
 }
 
+/**
+ * The one legitimate raw reader of `ctx.imports`.
+ *
+ * Every other lookup in core names what it wants — `ctx.output({ from, output
+ * }, field)` — because the instance file said so. This one has nothing to name:
+ * it SEARCHES the imports for outputs shaped like a vm, so that an instance
+ * importing exactly one vm need not repeat that vm's name. A ref-based
+ * resolver cannot express "whichever one it is", which is why this stays.
+ */
 export function findVmOutputs(imports: Record<string, unknown>): VmOutputs[] {
   return Object.values(imports).filter((o): o is VmOutputs => {
     if (typeof o !== 'object' || o === null) return false
@@ -104,12 +113,10 @@ export const vmProvisionModule = defineModule({
 
     const env: Record<string, string> = { ...config.env }
     for (const [key, secretKey] of Object.entries(config.envSecrets)) {
-      const value = ctx.secrets[secretKey]
       // Presence is the contract, not non-emptiness — an intentionally blank
       // placeholder lets a script no-op the step it gates until the real value
       // is filled in, at which point the digest changes and it re-provisions.
-      if (value === undefined) throw new Error(`secret "${secretKey}" not found in secrets.yaml`)
-      env[key] = value
+      env[key] = ctx.secret(secretKey, { allowBlank: true, field: `envSecrets.${key}` })
     }
 
     const volatileEnv = resolveVolatileEnv(config.volatileEnvFrom, ctx.imports)

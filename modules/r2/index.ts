@@ -4,7 +4,7 @@ import { cf, type CfOptions } from '../cloudflare-api'
 
 /**
  * r2 — provisions a Cloudflare R2 bucket via the REST API (turso-style:
- * token from ctx.secrets, idempotent list→create, console.log progress).
+ * token through ctx.secret, idempotent list→create, console.log progress).
  *
  * Exists so bucket lifecycle is owned by infra instead of being a side effect
  * of `wrangler deploy` prompting to create a missing bucket. A worker wires
@@ -52,8 +52,7 @@ export const r2Module = defineModule({
     bucketName: z.string(),
   }),
   async apply(config, ctx) {
-    const apiToken = ctx.secrets['CLOUDFLARE_API_TOKEN']
-    if (!apiToken) throw new Error('Missing secret: CLOUDFLARE_API_TOKEN')
+    const apiToken = ctx.secret('CLOUDFLARE_API_TOKEN')
     const base = `/accounts/${config.accountId}/r2/buckets`
 
     if (config.ephemeral) {
@@ -102,8 +101,7 @@ export const r2Module = defineModule({
     return { bucketName: config.bucketName }
   },
   async destroy(config, ctx) {
-    const apiToken = ctx.secrets['CLOUDFLARE_API_TOKEN']
-    if (!apiToken) throw new Error('Missing secret: CLOUDFLARE_API_TOKEN')
+    const apiToken = ctx.secret('CLOUDFLARE_API_TOKEN')
     try {
       await cf(
         apiToken,

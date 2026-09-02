@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import { defineModule } from '../../src/define-module'
-import { cf, cfRaw, resolveApiToken } from '../cloudflare-api'
+import { cf, cfRaw } from '../cloudflare-api'
 
 // cloudflare-zone — a DNS zone's records as repo state instead of dashboard
 // state. CLAUDE.md names Cloudflare DNS as off-box state we own; `cloudflare-token`
@@ -468,7 +468,7 @@ export const cloudflareZoneModule = defineModule({
     changed: z.boolean(),
   }),
   async apply(config, ctx) {
-    const token = resolveApiToken(config.apiToken, ctx.imports)
+    const token = ctx.output(config.apiToken, 'apiToken')
 
     // 1. Resolve the zone, and refuse a zone that lives somewhere else.
     const zones = await cf<

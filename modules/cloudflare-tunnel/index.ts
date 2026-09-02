@@ -2,7 +2,7 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 import { z } from 'zod'
 import { defineModule } from '../../src/define-module'
-import { cf, resolveApiToken } from '../cloudflare-api'
+import { cf } from '../cloudflare-api'
 
 // cloudflare-tunnel — a remotely-managed Cloudflare Tunnel as repo state: the
 // tunnel itself, its ingress rules, the DNS records that point at it, and the
@@ -258,7 +258,7 @@ export const cloudflareTunnelModule = defineModule({
     changed: z.boolean(),
   }),
   async apply(config, ctx) {
-    const token = resolveApiToken(config.apiToken, ctx.imports)
+    const token = ctx.output(config.apiToken, 'apiToken')
     assertHostnamesInZone(config.ingress, config.zone)
 
     // 1. Converge the tunnel by name. `is_deleted=false` matters: Cloudflare
@@ -418,7 +418,7 @@ export const cloudflareTunnelModule = defineModule({
     }
   },
   async destroy(config, ctx) {
-    const token = resolveApiToken(config.apiToken, ctx.imports)
+    const token = ctx.output(config.apiToken, 'apiToken')
     const found = await cf<CfTunnel[]>(
       token,
       'GET',

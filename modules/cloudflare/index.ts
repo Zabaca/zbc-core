@@ -3,13 +3,14 @@ import * as fs from 'node:fs'
 import { execSync, spawnSync } from 'node:child_process'
 import { z } from 'zod'
 import { defineModule } from '../../src/define-module'
+import type { ApplyContext } from '../../src/types'
 
 /**
  * cloudflare — deploys a Cloudflare Worker (optionally with static assets, a
  * Durable Object, and a Container) via `wrangler deploy`.
  *
  * This is a THIN orchestrator, the same shape as the turso module: `apply` runs
- * on the operator machine, reads CF creds from `ctx.secrets`, runs an optional
+ * on the operator machine, reads CF creds through `ctx.secret`, runs an optional
  * local build, then shells `wrangler deploy` in the package's own directory. The
  * Worker TOPOLOGY (name, assets binding, durable_objects, containers,
  * migrations) lives in that package's `wrangler.jsonc` — wrangler is the source
@@ -39,8 +40,8 @@ import { defineModule } from '../../src/define-module'
  * IMPORT SYNC: `workerSecrets` and `workerVars` entries can be either a plain
  * name (resolved from this environment's secrets.yaml, exactly as before) or a
  * `{ name, from, output }` reference into an imported instance's outputs
- * (`ctx.imports[from][output]`, populated by the engine from that instance's
- * validated outputs). Secrets are pushed via `wrangler secret put`, piped
+ * (`ctx.output({ from, output }, field)`, resolved by the engine from that
+ * instance's validated outputs). Secrets are pushed via `wrangler secret put`, piped
  * through stdin; vars are passed as `wrangler deploy --var KEY:VALUE`. The two
  * are deliberately separate fields — a var is visible in `wrangler.jsonc`/the
  * dashboard, a secret is not — so an imported value's exposure is an explicit
@@ -108,7 +109,7 @@ export function routeUrl(routes: string[]): string {
  * secrets.yaml), a `{ name, value }` literal (vars that are per-instance
  * config rather than secrets — e.g. DEFAULT_FROM — so a generic wrangler.jsonc
  * needs no editing), a `{ name, from, output }` reference into an imported
- * instance's outputs (`ctx.imports[from][output]`), or a `{ name, secret }`
+ * instance's outputs (`ctx.output`), or a `{ name, secret }`
  * pair that exposes a secrets.yaml key under a different env var name.
  */
 const workerValueSchema = z.union([
@@ -149,46 +150,24 @@ type WorkerValueEntry = z.infer<typeof workerValueSchema>
 /** Resolve a workerSecrets/workerVars entry to its `{ name, value }` pair. */
 function resolveWorkerValue(
   entry: WorkerValueEntry,
-  ctx: { secrets: Record<string, string>; imports: Record<string, unknown> },
+  ctx: ApplyContext,
   fieldName: string,
 ): { name: string; value: string } {
   if (typeof entry === 'string') {
-    const value = ctx.secrets[entry]
-    if (!value) {
-      throw new Error(
-        `${fieldName} references "${entry}" but it's missing from this environment's secrets.yaml`,
-      )
-    }
-    return { name: entry, value }
+    return { name: entry, value: ctx.secret(entry, { field: fieldName }) }
   }
 
   if ('value' in entry) {
     return { name: entry.name, value: entry.value }
   }
 
+  const field = `${fieldName} entry "${entry.name}"`
+
   if ('secret' in entry) {
-    const value = ctx.secrets[entry.secret]
-    if (!value) {
-      throw new Error(
-        `${fieldName} entry "${entry.name}" references secret "${entry.secret}", which is missing from this environment's secrets.yaml`,
-      )
-    }
-    return { name: entry.name, value }
+    return { name: entry.name, value: ctx.secret(entry.secret, { field }) }
   }
 
-  const instanceOutputs = ctx.imports[entry.from]
-  if (instanceOutputs === undefined) {
-    throw new Error(
-      `${fieldName} entry "${entry.name}" references instance "${entry.from}", which is not in this instance's imports`,
-    )
-  }
-  const value = (instanceOutputs as Record<string, unknown> | null)?.[entry.output]
-  if (typeof value !== 'string') {
-    throw new Error(
-      `${fieldName} entry "${entry.name}" references output "${entry.output}" on instance "${entry.from}", which doesn't emit it`,
-    )
-  }
-  return { name: entry.name, value }
+  return { name: entry.name, value: ctx.output(entry, field) }
 }
 
 /**
@@ -220,22 +199,13 @@ type R2BindingEntry = z.infer<typeof r2BindingSchema>
 
 function resolveR2Binding(
   entry: R2BindingEntry,
-  ctx: { imports: Record<string, unknown> },
+  ctx: ApplyContext,
 ): { binding: string; bucketName: string } {
   if ('bucketName' in entry) return { binding: entry.binding, bucketName: entry.bucketName }
-  const instanceOutputs = ctx.imports[entry.from]
-  if (instanceOutputs === undefined) {
-    throw new Error(
-      `r2Bindings entry "${entry.binding}" references instance "${entry.from}", which is not in this instance's imports`,
-    )
+  return {
+    binding: entry.binding,
+    bucketName: ctx.output(entry, `r2Bindings entry "${entry.binding}"`),
   }
-  const value = (instanceOutputs as Record<string, unknown> | null)?.[entry.output]
-  if (typeof value !== 'string') {
-    throw new Error(
-      `r2Bindings entry "${entry.binding}" references output "${entry.output}" on instance "${entry.from}", which doesn't emit it`,
-    )
-  }
-  return { binding: entry.binding, bucketName: value }
 }
 
 /** Strip line and block comments from JSONC, string-aware. */
@@ -461,10 +431,8 @@ export const cloudflareModule = defineModule({
     // tokenValue) when `apiToken` is set, else secrets.yaml. Resolved before
     // anything runs so a bad reference fails fast.
     const apiToken = config.apiToken
-      ? resolveWorkerValue({ name: 'CLOUDFLARE_API_TOKEN', ...config.apiToken }, ctx, 'apiToken')
-          .value
-      : ctx.secrets['CLOUDFLARE_API_TOKEN']
-    if (!apiToken) throw new Error('Missing secret: CLOUDFLARE_API_TOKEN')
+      ? ctx.output(config.apiToken, 'apiToken')
+      : ctx.secret('CLOUDFLARE_API_TOKEN')
 
     const env: NodeJS.ProcessEnv = {
       ...process.env,
@@ -575,27 +543,14 @@ export const cloudflareModule = defineModule({
     return { deployUrl, workerName }
   },
   async destroy(config, ctx) {
-    // The engine passes `imports: {}` to destroy (reverse-order teardown — the
-    // imported instance may already be gone), so an `apiToken` reference can't
-    // resolve here. Fall back to secrets.yaml; error only when neither exists.
-    let apiToken: string | undefined
-    if (config.apiToken) {
-      try {
-        apiToken = resolveWorkerValue(
-          { name: 'CLOUDFLARE_API_TOKEN', ...config.apiToken },
-          ctx,
-          'apiToken',
-        ).value
-      } catch {
-        apiToken = undefined
-      }
-    }
-    apiToken ??= ctx.secrets['CLOUDFLARE_API_TOKEN']
-    if (!apiToken) {
-      throw new Error(
-        'Missing secret: CLOUDFLARE_API_TOKEN (the apiToken import is not available at destroy — keep a CLOUDFLARE_API_TOKEN in secrets.yaml for environments that destroy workers)',
-      )
-    }
+    // Resolved exactly the way `apply` resolves it. The engine applies the
+    // referenced instance on demand when a destroy asks for its output, so the
+    // twenty lines that used to live here — a swallowed catch around the
+    // reference and a silent fall back to secrets.yaml, because destroy was
+    // handed `imports: {}` — say nothing this line does not.
+    const apiToken = config.apiToken
+      ? ctx.output(config.apiToken, 'apiToken')
+      : ctx.secret('CLOUDFLARE_API_TOKEN')
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       CLOUDFLARE_API_TOKEN: apiToken,

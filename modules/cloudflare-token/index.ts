@@ -151,8 +151,7 @@ export const cloudflareTokenModule = defineModule({
     s3SecretAccessKey: z.string(),
   }),
   async apply(config, ctx) {
-    const rootToken = ctx.secrets['CLOUDFLARE_ROOT_TOKEN']
-    if (!rootToken) throw new Error('Missing secret: CLOUDFLARE_ROOT_TOKEN')
+    const rootToken = ctx.secret('CLOUDFLARE_ROOT_TOKEN')
 
     // 1. Resolve permission names → group ids. Fail fast before any mutation.
     const available = await cf<PermissionGroup[]>(
@@ -233,8 +232,7 @@ export const cloudflareTokenModule = defineModule({
     return { tokenId, tokenValue, ...deriveS3Credentials(tokenId, tokenValue) }
   },
   async destroy(config, ctx) {
-    const rootToken = ctx.secrets['CLOUDFLARE_ROOT_TOKEN']
-    if (!rootToken) throw new Error('Missing secret: CLOUDFLARE_ROOT_TOKEN')
+    const rootToken = ctx.secret('CLOUDFLARE_ROOT_TOKEN')
     const existing = await findTokenByName(rootToken, config.accountId, config.tokenName)
     if (!existing) {
       console.log(`  Token "${config.tokenName}" already absent`)

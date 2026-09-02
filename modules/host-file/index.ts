@@ -22,14 +22,13 @@ export const hostFileModule = defineModule({
     }),
   outputs: z.object({ path: z.string(), changed: z.boolean() }),
   apply: async (config, ctx) => {
+    // `allowBlank`: presence is the contract. An empty secret is a legitimate
+    // file body, and refusing it would make "no value yet" unrepresentable.
     const desired =
-      config.content !== undefined ? config.content : ctx.secrets[config.secretKey!]
-    if (desired === undefined) {
-      throw new Error(`secret "${config.secretKey}" not found in secrets.yaml`)
-    }
-    const existing = fs.existsSync(config.path)
-      ? fs.readFileSync(config.path, 'utf8')
-      : null
+      config.content !== undefined
+        ? config.content
+        : ctx.secret(config.secretKey!, { allowBlank: true })
+    const existing = fs.existsSync(config.path) ? fs.readFileSync(config.path, 'utf8') : null
     const changed = existing !== desired
     const mode = parseInt(config.mode, 8)
     if (changed) {
