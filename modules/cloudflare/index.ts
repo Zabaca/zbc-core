@@ -336,9 +336,10 @@ export const cloudflareModule = defineModule({
      * original behavior). Set `{ from, output }` to pull it from an imported
      * instance's outputs instead — e.g. a `cloudflare-token` instance's
      * `tokenValue` — so a minted, per-apply-rolled deploy token flows straight
-     * to wrangler and never sits at rest. NOTE: the engine passes no imports
-     * to `destroy`, so environments that destroy workers (ephemeral previews)
-     * still need the secrets.yaml fallback for teardown.
+     * to wrangler and never sits at rest. `destroy` resolves it the same way:
+     * the engine applies the imported instance on demand when a teardown asks
+     * for its output, so an environment that destroys workers — an ephemeral
+     * instance, or `zbc destroy preview` — needs no secrets.yaml fallback.
      */
     apiToken: z.object({ from: z.string(), output: z.string() }).optional(),
     /** Optional local build run before deploy (e.g. `vite build` for assets). */

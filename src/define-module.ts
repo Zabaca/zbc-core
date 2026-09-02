@@ -10,6 +10,38 @@ interface DefineModuleOptions<TConfig extends z.ZodType, TOutputs extends z.ZodT
   destroy?: DestroyFn<z.infer<TConfig>>
 }
 
+/**
+ * The four modules that declared `ephemeral` in their own config schema before
+ * 0.14 — and therefore the only four for which `config: { ephemeral: true }` in
+ * a consumer's checked-in instance file ever meant anything.
+ *
+ * The list is deliberately closed. Every other module's `z.object` STRIPPED an
+ * `ephemeral` key, so a stray one — copy-pasted from the old README, which
+ * documented the flag as a config field — was silently inert. Honouring it
+ * everywhere would give that stray key teeth it never had: `wrangler delete
+ * --force` against a live Worker on the next `zbc apply production`, or a hard
+ * failure on a module that has no `destroy` at all.
+ */
+const LEGACY_EPHEMERAL_MODULES = new Set(['turso', 'r2', 'fly', 'cloudflare-token'])
+
+/**
+ * The pre-0.14 spelling: `ephemeral` as a field of a module's own config
+ * schema. Three of the four modules above acted on it inline, with three
+ * different failure policies; the fourth declared it and never read it. The
+ * engine owns the rule now, but a consumer's checked-in preview instance files
+ * still say `config: { ephemeral: true }` and `zbc update` must not break them —
+ * so that spelling keeps working for those four, with a deprecation line
+ * printed by `zbc apply`.
+ */
+export function legacyConfigEphemeral(moduleName: string, config: unknown): boolean {
+  return (
+    LEGACY_EPHEMERAL_MODULES.has(moduleName) &&
+    typeof config === 'object' &&
+    config !== null &&
+    (config as Record<string, unknown>).ephemeral === true
+  )
+}
+
 export function defineModule<TConfig extends z.ZodType, TOutputs extends z.ZodType>(
   opts: DefineModuleOptions<TConfig, TOutputs>,
 ): ModuleDefinition<TConfig, TOutputs> {
@@ -30,6 +62,7 @@ export function defineModule<TConfig extends z.ZodType, TOutputs extends z.ZodTy
         moduleName: opts.name,
         config: instanceOpts.config,
         imports: instanceOpts.imports ?? [],
+        ephemeral: instanceOpts.ephemeral ?? legacyConfigEphemeral(opts.name, instanceOpts.config),
         _outputsSchema: opts.outputs,
         _definition: definition as ModuleDefinition<any, TOutputs>,
       }

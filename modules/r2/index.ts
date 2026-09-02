@@ -40,13 +40,6 @@ export const r2Module = defineModule({
      * applied at creation; Cloudflare doesn't support relocating a bucket.
      */
     locationHint: z.string().optional(),
-    /**
-     * Destroy+recreate on every apply (preview environments). NOTE: deleting
-     * a non-empty bucket fails — the management API has no object purge, so
-     * ephemeral only works cleanly for buckets whose objects the app cleans
-     * up, or that stay small enough to purge by hand.
-     */
-    ephemeral: z.boolean().default(false),
   }),
   outputs: z.object({
     bucketName: z.string(),
@@ -54,22 +47,6 @@ export const r2Module = defineModule({
   async apply(config, ctx) {
     const apiToken = ctx.secret('CLOUDFLARE_API_TOKEN')
     const base = `/accounts/${config.accountId}/r2/buckets`
-
-    if (config.ephemeral) {
-      try {
-        await cf(
-          apiToken,
-          'DELETE',
-          `${base}/${encodeURIComponent(config.bucketName)}`,
-          undefined,
-          OPTS,
-        )
-        console.log(`  Deleted ephemeral bucket "${config.bucketName}"`)
-      } catch {
-        // Didn't exist (or non-empty — creation below will then no-op via the
-        // existence check, which for ephemeral means stale objects persist).
-      }
-    }
 
     const listing = await cf<{ buckets: Array<{ name: string }> }>(
       apiToken,
@@ -100,6 +77,15 @@ export const r2Module = defineModule({
 
     return { bucketName: config.bucketName }
   },
+  /**
+   * Delete the bucket. NOTE: the management API refuses to delete a NON-EMPTY
+   * bucket and has no object purge, so this — and therefore an `ephemeral: true`
+   * r2 instance, whose destroy+re-apply the engine drives — only comes out clean
+   * for buckets whose objects the app itself removes, or that stay small enough
+   * to purge by hand. A refusal is logged, not thrown: it is the ordinary
+   * outcome for a bucket still holding data, and a `zbc destroy` that aborted
+   * there would strand every instance behind it.
+   */
   async destroy(config, ctx) {
     const apiToken = ctx.secret('CLOUDFLARE_API_TOKEN')
     try {

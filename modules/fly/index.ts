@@ -271,8 +271,6 @@ export const flyModule = defineModule({
      * record, to order the two within one apply.
      */
     certs: z.array(z.string()).default([]),
-    /** Destroy+recreate the whole app on every apply (preview environments). */
-    ephemeral: z.boolean().default(false),
   }),
   outputs: z.object({
     appName: z.string(),
@@ -293,12 +291,6 @@ export const flyModule = defineModule({
       throw new Error(
         `fly: no app name — set \`appName\` in the instance config, or \`app = "..."\` in ${config.workdir}/fly.toml`,
       )
-    }
-
-    // 0. Ephemeral: tear the whole app down first so every apply starts clean.
-    if (config.ephemeral) {
-      console.log(`  Ephemeral: destroying ${appName} before recreate`)
-      fly(workdir, ['apps', 'destroy', appName, '--yes'], env, { allowFailure: true })
     }
 
     // 1. Ensure the app exists. `fly deploy` does not create one, and the

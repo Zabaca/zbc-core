@@ -96,7 +96,6 @@ export const tursoModule = defineModule({
     dbName: z.string(),
     group: z.string().default('default'),
     primaryLocation: z.string().default('iad'),
-    ephemeral: z.boolean().default(false),
     /**
      * Path to a Drizzle migrations folder, relative to the monorepo root
      * (resolved via ctx.projectRoot). When provided, apply() runs migrations
@@ -119,16 +118,6 @@ export const tursoModule = defineModule({
     // all. Nothing needs the API client until an apply actually runs.
     const { createClient } = await import('@tursodatabase/api')
     const turso = createClient({ org: config.orgName, token: apiToken })
-
-    // For ephemeral databases, destroy first to get a clean state
-    if (config.ephemeral) {
-      try {
-        await turso.databases.delete(config.dbName)
-        console.log(`  Deleted ephemeral database "${config.dbName}"`)
-      } catch {
-        // Database didn't exist — that's fine
-      }
-    }
 
     // Check if database already exists
     const databases = await turso.databases.list()

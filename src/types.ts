@@ -92,6 +92,17 @@ export interface InstanceOptions<TConfig extends z.ZodType> {
   name: string
   config: z.input<TConfig>
   imports?: ModuleInstance[]
+  /**
+   * Destroy, then apply, on every `zbc apply` — a clean resource each run.
+   * Requires the module to define `destroy`; an ephemeral instance of a module
+   * without one is refused before anything is applied.
+   *
+   * A property of the INSTANCE, not of the module's config: whether a preview
+   * resource is thrown away each run is the environment's decision, and four
+   * modules each restating it in their own schema is how three of them ended up
+   * with three different failure policies and the fourth with none at all.
+   */
+  ephemeral?: boolean
 }
 
 export interface ModuleInstance<TOutputs extends z.ZodType = z.ZodType> {
@@ -99,6 +110,8 @@ export interface ModuleInstance<TOutputs extends z.ZodType = z.ZodType> {
   moduleName: string
   config: unknown
   imports: ModuleInstance[]
+  /** See `InstanceOptions.ephemeral`. Always set — the engine reads it directly. */
+  ephemeral: boolean
   _outputsSchema: TOutputs
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   _definition: ModuleDefinition<any, TOutputs>

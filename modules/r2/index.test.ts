@@ -76,16 +76,6 @@ describe('apply converges', () => {
     expect(creates(calls)[0]!.body).toEqual({ name: 'proj-prod', locationHint: 'wnam' })
   })
 
-  test('ephemeral deletes first, then recreates', async () => {
-    // The delete lands before the listing, and the listing is what the stub
-    // answers from — so this asserts the order, not the resulting state.
-    const calls = installFetchStub({ buckets: [] })
-    await r2Module.apply(config({ ephemeral: true }), CTX)
-
-    expect(calls[0]!.method).toBe('DELETE')
-    expect(creates(calls)).toHaveLength(1)
-  })
-
   test('a rejected token names the one scope this module needs', async () => {
     const calls = installFetchStub({
       override: () => [

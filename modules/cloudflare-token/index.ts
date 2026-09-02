@@ -138,8 +138,6 @@ export const cloudflareTokenModule = defineModule({
      * to grant zone-scoped groups on all zones of the account.
      */
     zones: z.array(z.string()).default([]),
-    /** Destroy+recreate on every apply (per-PR preview tokens). */
-    ephemeral: z.boolean().default(false),
   }),
   outputs: z.object({
     tokenId: z.string(),
