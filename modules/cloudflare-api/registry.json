@@ -8,5 +8,5 @@
   ],
   "dependencies": {},
   "secrets": [],
-  "instructions": "Not a module: it exports no defineModule. It is the library `cloudflare-access`, `cloudflare-tunnel` and `cloudflare-zone` import as `../cloudflare-api`. It exists because the same envelope-unwrapping had reached four copies in the contributing repo before anybody counted — `success`, `errors`, `result` is not hard, and that is exactly why it gets rewritten slightly differently every time. In COPY mode add it alongside whichever Cloudflare module you copied."
+  "instructions": "Not a module: it exports no defineModule. It is the library every Cloudflare REST module imports as `../cloudflare-api` — `cloudflare-access`, `cloudflare-email`, `cloudflare-tunnel`, `cloudflare-token`, `cloudflare-zone` and `r2`. It exists because the same envelope-unwrapping had reached four copies in the contributing repo before anybody counted — `success`, `errors`, `result` is not hard, and that is exactly why it gets rewritten slightly differently every time. In COPY mode add it alongside whichever Cloudflare module you copied."
 }

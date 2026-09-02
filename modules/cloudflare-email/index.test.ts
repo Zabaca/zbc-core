@@ -1,5 +1,5 @@
-import { describe, expect, test } from 'bun:test'
-import { classifySendingDns, readSendingDnsRecord } from './index'
+import { afterEach, describe, expect, test } from 'bun:test'
+import { classifySendingDns, cloudflareEmailModule, readSendingDnsRecord } from './index'
 
 // Cloudflare's Email Sending API is beta and the module reads its record
 // objects defensively, which is right. What was wrong is where the defensive
@@ -82,5 +82,78 @@ describe('classifySendingDns', () => {
     const v = classifySendingDns([])
     expect(v.pending).toEqual([])
     expect(v.unreported).toEqual([])
+  })
+})
+
+// ── the envelope this module no longer owns ─────────────────────────────────
+//
+// Until 2026-09-02 this file carried a private `cfFetch` with its own error
+// types and its own copy of the base URL. It now calls `../cloudflare-api`, and
+// the two things the copy did that the seam did not — a typed error carrying
+// the status, and per-code scope guidance — moved into the seam as `CfError`
+// and `CfOptions.hints` rather than being dropped.
+//
+// The scope hint is the operator-facing half: a 10000 means the token is short
+// a scope, and which five scopes it needs is the only thing this module knows
+// that the seam does not.
+
+const realFetch = globalThis.fetch
+afterEach(() => {
+  globalThis.fetch = realFetch
+})
+
+const CONFIG = {
+  accountId: 'acct-1',
+  zoneId: 'zone-1',
+  domain: 'mail.example.com',
+  enableSending: true,
+}
+
+async function applyAgainst(body: unknown, status: number): Promise<Error> {
+  globalThis.fetch = (async () => new Response(JSON.stringify(body), { status })) as typeof fetch
+  try {
+    await cloudflareEmailModule.apply(cloudflareEmailModule.configSchema.parse(CONFIG), {
+      secrets: { CLOUDFLARE_API_TOKEN: 'tok' },
+      imports: {},
+      projectRoot: '/tmp',
+    })
+  } catch (e) {
+    return e as Error
+  }
+  throw new Error('expected apply to throw')
+}
+
+describe('a failure Cloudflare reported', () => {
+  test('the undocumented `{code, error}` shape surfaces its code', async () => {
+    // The 2026-08-15 shape. The old copy read `e.message` only, so this
+    // arrived as `…failed (HTTP 403): undefined: undefined`.
+    const err = await applyAgainst(
+      { success: false, result: null, errors: [{ code: 1010, error: 'auth.forbidden' }] },
+      403,
+    )
+    expect(err.message).toContain('1010')
+    expect(err.message).toContain('auth.forbidden')
+  })
+
+  test('a 10000 still names all five token scopes the operator has to grant', async () => {
+    const err = await applyAgainst(
+      { success: false, result: null, errors: [{ code: 10000, message: 'Authentication error' }] },
+      403,
+    )
+    expect(err.message).toContain('Zone → Email Routing Rules: Edit')
+    expect(err.message).toContain('Zone → Zone Settings: Edit')
+    expect(err.message).toContain('Zone → DNS: Edit')
+    expect(err.message).toContain('Account → Email Sending: Edit')
+    expect(err.message).toContain('Account → Email Routing Addresses: Edit')
+    expect(err.message).toContain('https://dash.cloudflare.com/profile/api-tokens')
+  })
+
+  test('a 10105 says the account needs a Workers Paid plan, not "authentication"', async () => {
+    const err = await applyAgainst(
+      { success: false, result: null, errors: [{ code: 10105, message: 'not entitled' }] },
+      403,
+    )
+    expect(err.message).toContain('Workers Paid plan')
+    expect(err.message).not.toContain('Email Routing Rules')
   })
 })

@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { defineModule } from '../../src/define-module'
+import { cf, type CfOptions } from '../cloudflare-api'
 
 /**
  * r2 — provisions a Cloudflare R2 bucket via the REST API (turso-style:
@@ -13,46 +14,18 @@ import { defineModule } from '../../src/define-module'
  * Token scope: CLOUDFLARE_API_TOKEN needs Account → Workers R2 Storage: Edit.
  */
 
-const API = 'https://api.cloudflare.com/client/v4'
-
-interface CfEnvelope<T> {
-  success: boolean
-  errors: Array<{ code: number; message: string }>
-  result: T
-}
-
-async function cfFetch<T>(
-  token: string,
-  path: string,
-  init?: { method?: string; body?: unknown },
-): Promise<T> {
-  const res = await fetch(`${API}${path}`, {
-    method: init?.method ?? 'GET',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: init?.body === undefined ? undefined : JSON.stringify(init.body),
-  })
-  let envelope: CfEnvelope<T>
-  try {
-    envelope = (await res.json()) as CfEnvelope<T>
-  } catch {
-    throw new Error(`Cloudflare API ${path}: HTTP ${res.status} (non-JSON body)`)
-  }
-  if (!res.ok || !envelope.success) {
-    const codes = (envelope.errors ?? []).map((e) => e.code)
-    const detail = (envelope.errors ?? []).map((e) => `${e.code}: ${e.message}`).join('; ')
-    if (codes.includes(10000)) {
-      throw new Error(
-        `Cloudflare API ${path} rejected the token (10000 Authentication error). ` +
-          `CLOUDFLARE_API_TOKEN is likely missing the Account → Workers R2 Storage: Edit scope. ` +
-          `Edit the token at https://dash.cloudflare.com/profile/api-tokens and re-run zbc apply.`,
-      )
-    }
-    throw new Error(`Cloudflare API ${path} failed (HTTP ${res.status}): ${detail}`)
-  }
-  return envelope.result
+/**
+ * Named per-code guidance for this module's calls — the one genuinely
+ * per-module part of a Cloudflare failure. Everything else about the envelope
+ * (the base URL, the error shapes, the typed throw) is `../cloudflare-api`'s.
+ */
+const OPTS: CfOptions = {
+  hints: {
+    10000:
+      `rejected the token (10000 Authentication error). ` +
+      `CLOUDFLARE_API_TOKEN is likely missing the Account → Workers R2 Storage: Edit scope. ` +
+      `Edit the token at https://dash.cloudflare.com/profile/api-tokens and re-run zbc apply.`,
+  },
 }
 
 export const r2Module = defineModule({
@@ -85,9 +58,13 @@ export const r2Module = defineModule({
 
     if (config.ephemeral) {
       try {
-        await cfFetch(apiToken, `${base}/${encodeURIComponent(config.bucketName)}`, {
-          method: 'DELETE',
-        })
+        await cf(
+          apiToken,
+          'DELETE',
+          `${base}/${encodeURIComponent(config.bucketName)}`,
+          undefined,
+          OPTS,
+        )
         console.log(`  Deleted ephemeral bucket "${config.bucketName}"`)
       } catch {
         // Didn't exist (or non-empty — creation below will then no-op via the
@@ -95,22 +72,28 @@ export const r2Module = defineModule({
       }
     }
 
-    const listing = await cfFetch<{ buckets: Array<{ name: string }> }>(
+    const listing = await cf<{ buckets: Array<{ name: string }> }>(
       apiToken,
+      'GET',
       `${base}?per_page=1000`,
+      undefined,
+      OPTS,
     )
     const exists = listing.buckets.some((b) => b.name === config.bucketName)
 
     if (exists) {
       console.log(`  Bucket "${config.bucketName}" already exists`)
     } else {
-      await cfFetch(apiToken, base, {
-        method: 'POST',
-        body: {
+      await cf(
+        apiToken,
+        'POST',
+        base,
+        {
           name: config.bucketName,
           ...(config.locationHint ? { locationHint: config.locationHint } : {}),
         },
-      })
+        OPTS,
+      )
       console.log(
         `  Created bucket "${config.bucketName}"${config.locationHint ? ` (${config.locationHint})` : ''}`,
       )
@@ -122,10 +105,12 @@ export const r2Module = defineModule({
     const apiToken = ctx.secrets['CLOUDFLARE_API_TOKEN']
     if (!apiToken) throw new Error('Missing secret: CLOUDFLARE_API_TOKEN')
     try {
-      await cfFetch(
+      await cf(
         apiToken,
+        'DELETE',
         `/accounts/${config.accountId}/r2/buckets/${encodeURIComponent(config.bucketName)}`,
-        { method: 'DELETE' },
+        undefined,
+        OPTS,
       )
       console.log(`  Deleted bucket "${config.bucketName}"`)
     } catch (err) {

@@ -9,8 +9,19 @@
 // previous convention was a comment asking a human to notice, and by the time
 // anybody counted the Cloudflare resolver was at four copies.
 //
-// The base URL is the load-bearing one. `https://api.cloudflare.com/client/v4`
-// is a version pin, not a protocol constant: the day it moves, it moves once.
+// The base URL below is the load-bearing one. Its `client/v4` is a version
+// pin, not a protocol constant: the day it moves, it moves once — a promise
+// that holds only while the string is written down in exactly one place, so it
+// is deliberately absent from every comment in `modules/`, this one included.
+//
+// `cloudflare-email`, `cloudflare-token` and `r2` predated the extraction and
+// carried private copies until 2026-09-02. Two of the copies knew things this
+// file did not — that a body is not always JSON, and that a caller sometimes
+// has to branch on the status — so they were folded in here (`CfError`, the
+// non-JSON guard, `!res.ok`) rather than dropped on the way over. The only
+// genuinely per-module part was naming which token scope was missing, and that
+// is `CfOptions.hints`. `c9s/src/cf.ts` is a fifth copy and stays: it lives in
+// a separate package and cannot import a template.
 
 export const API = 'https://api.cloudflare.com/client/v4'
 
@@ -89,25 +100,129 @@ export function describeCfErrors(errors: unknown, status: number): string {
 }
 
 /**
- * Call the API and return the WHOLE envelope; throw the API's own message on
- * failure. Callers that paginate need `result_info`, which is why this exists
- * alongside `cf` rather than under it.
+ * A failed Cloudflare call, with the two facts a caller may need to branch on:
+ * the HTTP status, and every error code the envelope carried.
+ *
+ * `cloudflare-email` is why this is a class and not a bare `Error`: one of its
+ * routing endpoints answers 404 on a shape the module then retries as a POST,
+ * and `err.status === 404` is the only way to tell that apart from a real
+ * failure. Everything thrown from `cfRaw`/`cf` is a `CfError`, so `instanceof`
+ * is a safe narrowing at any call site — including the non-JSON case, where
+ * `codes` is empty because there was no envelope to read codes out of.
+ */
+export class CfError extends Error {
+  constructor(
+    readonly status: number,
+    readonly codes: number[],
+    message: string,
+  ) {
+    super(message)
+    this.name = 'CfError'
+  }
+
+  /** Did the envelope carry this error code? */
+  has(code: number): boolean {
+    return this.codes.includes(code)
+  }
+}
+
+/** Per-call options for `cf`/`cfRaw`. */
+export interface CfOptions {
+  /**
+   * Per-code replacements for the thrown message — the module's scope hint.
+   *
+   * A 10000 "Authentication error" is the same fact for every module and a
+   * different instruction for each: `cloudflare-email` needs five token scopes
+   * named, `r2` needs one. That naming is the only genuinely per-module part of
+   * a Cloudflare failure, so it is the only hook here — the seam still throws
+   * `CfError` with the same status and codes, and only the text changes.
+   *
+   * When an envelope carries several hinted codes, the LOWEST code wins —
+   * deliberately, because the alternative is the order Cloudflare happened to
+   * list its errors in, and a module's operator-facing text must not depend on
+   * that. It also reproduces the copies this replaced, which tested their codes
+   * in a fixed order (`cloudflare-email` checked 10000 before 10105).
+   */
+  hints?: Record<number, string>
+}
+
+/**
+ * Every error code the envelope carried, as numbers.
+ *
+ * `code` is typed `number | string` because Cloudflare sends both spellings; a
+ * numeric string is the same code and is coerced, and anything else — a
+ * non-numeric string, a missing field, an entry that is not an object at all —
+ * is not a code and is dropped rather than surfaced as `NaN`.
+ *
+ * Pure; exported for tests.
+ */
+export function collectCfCodes(errors: unknown): number[] {
+  const entries = Array.isArray(errors) ? errors : []
+  const codes: number[] = []
+  for (const entry of entries) {
+    const raw = (entry as CfApiError | null | undefined)?.code
+    const code =
+      typeof raw === 'number'
+        ? raw
+        : typeof raw === 'string' && raw.trim() !== ''
+          ? Number(raw)
+          : Number.NaN
+    if (Number.isFinite(code)) codes.push(code)
+  }
+  return codes
+}
+
+/**
+ * Call the API and return the WHOLE envelope; throw a `CfError` on failure.
+ * Callers that paginate need `result_info`, which is why this exists alongside
+ * `cf` rather than under it.
+ *
+ * Two things it refuses to assume, both learned from the private copies this
+ * replaced:
+ *
+ * - **The body is JSON.** A 5xx from Cloudflare's edge is an HTML page, and
+ *   `res.json()` on it throws a parse error that names neither the call nor the
+ *   status — the one moment a stack trace is least useful.
+ * - **`success` is the whole verdict.** It usually is, which is why the field
+ *   exists; but a body that says `success: true` under a 4xx did not succeed,
+ *   and returning its `result` hands the caller a shape it never checked.
  */
 export async function cfRaw<T>(
   token: string,
   method: string,
   path: string,
   body?: unknown,
+  opts?: CfOptions,
 ): Promise<CfEnvelope<T>> {
   const res = await fetch(`${API}${path}`, {
     method,
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   })
-  const payload = (await res.json()) as CfEnvelope<T>
-  if (!payload.success) {
-    throw new Error(
-      `Cloudflare API ${method} ${path} failed: ${describeCfErrors(payload.errors, res.status)}`,
+  let payload: CfEnvelope<T> | null
+  try {
+    payload = (await res.json()) as CfEnvelope<T> | null
+  } catch {
+    throw new CfError(
+      res.status,
+      [],
+      `Cloudflare API ${method} ${path}: HTTP ${res.status} (non-JSON body)`,
+    )
+  }
+  if (!res.ok || !payload?.success) {
+    const codes = collectCfCodes(payload?.errors)
+    // Scanned over the hints rather than over `codes`, so which one wins is the
+    // module's own ordering and not the API's — see `CfOptions.hints`.
+    const hinted = Object.keys(opts?.hints ?? {})
+      .map(Number)
+      .find((code) => codes.includes(code))
+    const hint = hinted === undefined ? undefined : opts?.hints?.[hinted]
+    throw new CfError(
+      res.status,
+      codes,
+      hint === undefined
+        ? `Cloudflare API ${method} ${path} failed: ${describeCfErrors(payload?.errors, res.status)}`
+        : `Cloudflare API ${method} ${path} ${hint}`,
     )
   }
   return payload
@@ -119,8 +234,9 @@ export async function cf<T>(
   method: string,
   path: string,
   body?: unknown,
+  opts?: CfOptions,
 ): Promise<T> {
-  return (await cfRaw<T>(token, method, path, body)).result
+  return (await cfRaw<T>(token, method, path, body, opts)).result
 }
 
 /**

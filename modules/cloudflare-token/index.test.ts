@@ -422,3 +422,33 @@ describe('deriveS3Credentials', () => {
     )
   })
 })
+
+// ── the failure shape the private copy could not read ───────────────────────
+//
+// This module carried its own `cf` until 2026-09-02, and it typed `errors` as
+// `Array<{message: string}>` — the exact claim `../cloudflare-api`'s header
+// documents as false. A `{code, error}` failure mapped to `[undefined]`, joined
+// to the empty string, fell through `||`, and reached the operator as a bare
+// `HTTP 403`: the one fact in the response was the one field never read.
+//
+// Reading the envelope through the seam is the point of the conversion, so it
+// is asserted here rather than trusted.
+
+describe('a failure in the undocumented shape', () => {
+  test('surfaces its code instead of a bare HTTP status', async () => {
+    const { error, calls } = await runApply({
+      state: {
+        override: (method, url) =>
+          method === 'GET' && url.includes('/tokens/permission_groups')
+            ? { success: false, result: null, errors: [{ code: 1010, error: 'auth.forbidden' }] }
+            : undefined,
+      },
+    })
+
+    expect(error).toBeDefined()
+    expect(error!.message).toContain('1010')
+    expect(error!.message).toContain('auth.forbidden')
+    // Permission resolution fails before anything mutates.
+    expect(byMethod(calls, 'POST', '/accounts/acct-1/tokens')).toHaveLength(0)
+  })
+})

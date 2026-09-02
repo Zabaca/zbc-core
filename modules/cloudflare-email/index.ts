@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { defineModule } from '../../src/define-module'
+import { CfError, cf, type CfOptions } from '../cloudflare-api'
 
 /**
  * cloudflare-email — provisions Cloudflare Email Service (public beta) for a
@@ -26,76 +27,25 @@ import { defineModule } from '../../src/define-module'
  *   merge them manually — two SPF records break SPF evaluation entirely.
  */
 
-const API = 'https://api.cloudflare.com/client/v4'
-
-interface CfEnvelope<T> {
-  success: boolean
-  errors: Array<{ code: number; message: string }>
-  result: T
-}
-
-class CfError extends Error {
-  constructor(
-    public status: number,
-    public codes: number[],
-    message: string,
-  ) {
-    super(message)
-  }
-  has(code: number): boolean {
-    return this.codes.includes(code)
-  }
-}
-
-async function cfFetch<T>(
-  token: string,
-  path: string,
-  init?: { method?: string; body?: unknown },
-): Promise<T> {
-  const res = await fetch(`${API}${path}`, {
-    method: init?.method ?? 'GET',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: init?.body === undefined ? undefined : JSON.stringify(init.body),
-  })
-  let envelope: CfEnvelope<T>
-  try {
-    envelope = (await res.json()) as CfEnvelope<T>
-  } catch {
-    throw new CfError(res.status, [], `Cloudflare API ${path}: HTTP ${res.status} (non-JSON body)`)
-  }
-  if (!res.ok || !envelope.success) {
-    const codes = (envelope.errors ?? []).map((e) => e.code)
-    const detail = (envelope.errors ?? []).map((e) => `${e.code}: ${e.message}`).join('; ')
-    if (codes.includes(10000)) {
-      throw new CfError(
-        res.status,
-        codes,
-        `Cloudflare API ${path} rejected the token (10000 Authentication error). ` +
-          `CLOUDFLARE_API_TOKEN is likely missing a scope — it needs: ` +
-          `Zone → Email Routing Rules: Edit, Zone → Zone Settings: Edit (the routing ` +
-          `enable/settings/DNS endpoints live under generic Zone Settings), Zone → DNS: Edit, ` +
-          `Account → Email Sending: Edit, Account → Email Routing Addresses: Edit. Edit the token at ` +
-          `https://dash.cloudflare.com/profile/api-tokens and re-run zbc apply.`,
-      )
-    }
-    if (codes.includes(10105)) {
-      throw new CfError(
-        res.status,
-        codes,
-        `Cloudflare API ${path}: account not entitled to Email Sending (10105). ` +
-          `Email Sending requires a Workers Paid plan — upgrade the account, then re-run zbc apply.`,
-      )
-    }
-    throw new CfError(
-      res.status,
-      codes,
-      `Cloudflare API ${path} failed (HTTP ${res.status}): ${detail}`,
-    )
-  }
-  return envelope.result
+/**
+ * Named per-code guidance for this module's calls — the one genuinely
+ * per-module part of a Cloudflare failure, and the reason `CfOptions.hints`
+ * exists. Everything else about the envelope (the base URL, the error shapes,
+ * the non-JSON guard, the typed throw) is `../cloudflare-api`'s.
+ */
+const OPTS: CfOptions = {
+  hints: {
+    10000:
+      `rejected the token (10000 Authentication error). ` +
+      `CLOUDFLARE_API_TOKEN is likely missing a scope — it needs: ` +
+      `Zone → Email Routing Rules: Edit, Zone → Zone Settings: Edit (the routing ` +
+      `enable/settings/DNS endpoints live under generic Zone Settings), Zone → DNS: Edit, ` +
+      `Account → Email Sending: Edit, Account → Email Routing Addresses: Edit. Edit the token at ` +
+      `https://dash.cloudflare.com/profile/api-tokens and re-run zbc apply.`,
+    10105:
+      `failed: the account is not entitled to Email Sending (10105). ` +
+      `Email Sending requires a Workers Paid plan — upgrade the account, then re-run zbc apply.`,
+  },
 }
 
 /**
@@ -201,17 +151,17 @@ async function ensureDestinationVerified(
   accountId: string,
   email: string,
 ): Promise<void> {
-  const addresses = await cfFetch<Array<{ email: string; verified?: string | null }>>(
+  const addresses = await cf<Array<{ email: string; verified?: string | null }>>(
     token,
+    'GET',
     `/accounts/${accountId}/email/routing/addresses?per_page=50`,
+    undefined,
+    OPTS,
   )
   const existing = addresses.find((a) => a.email.toLowerCase() === email.toLowerCase())
   if (existing?.verified) return
   if (!existing) {
-    await cfFetch(token, `/accounts/${accountId}/email/routing/addresses`, {
-      method: 'POST',
-      body: { email },
-    })
+    await cf(token, 'POST', `/accounts/${accountId}/email/routing/addresses`, { email }, OPTS)
     console.log(`  Created destination address ${email} — verification email sent`)
   }
   throw new Error(
@@ -315,18 +265,24 @@ export const cloudflareEmailModule = defineModule({
 
     // ── 1. Outbound sending: onboard the (sub)domain, surface DNS status ────
     if (config.enableSending) {
-      const subdomains = await cfFetch<SendingSubdomain[]>(
+      const subdomains = await cf<SendingSubdomain[]>(
         token,
+        'GET',
         `/zones/${zoneId}/email/sending/subdomains`,
+        undefined,
+        OPTS,
       )
       let sub = subdomains.find((s) => s.name === domain)
       if (sub) {
         console.log(`  Sending: ${domain} already onboarded`)
       } else {
-        sub = await cfFetch<SendingSubdomain>(token, `/zones/${zoneId}/email/sending/subdomains`, {
-          method: 'POST',
-          body: { name: domain },
-        })
+        sub = await cf<SendingSubdomain>(
+          token,
+          'POST',
+          `/zones/${zoneId}/email/sending/subdomains`,
+          { name: domain },
+          OPTS,
+        )
         console.log(`  Sending: onboarded ${domain} (SPF/DKIM/DMARC/bounce-MX auto-provisioned)`)
       }
       sendingEnabled = true
@@ -334,9 +290,12 @@ export const cloudflareEmailModule = defineModule({
       // DNS record verification status. Field names are beta-era; read
       // defensively and record whatever type/name/status the API returns.
       try {
-        const dns = await cfFetch<unknown>(
+        const dns = await cf<unknown>(
           token,
+          'GET',
           `/zones/${zoneId}/email/sending/subdomains/${sub.tag}/dns`,
+          undefined,
+          OPTS,
         )
         const records: Array<Record<string, unknown>> = Array.isArray(dns)
           ? (dns as Array<Record<string, unknown>>)
@@ -362,14 +321,17 @@ export const cloudflareEmailModule = defineModule({
 
     // ── 2. Inbound routing: enable, subdomain DNS, rules, catch-all ─────────
     if (config.enableRouting) {
-      const settings = await cfFetch<{ enabled?: boolean; status?: string }>(
+      const settings = await cf<{ enabled?: boolean; status?: string }>(
         token,
+        'GET',
         `/zones/${zoneId}/email/routing`,
+        undefined,
+        OPTS,
       )
       if (settings.enabled || settings.status === 'ready') {
         console.log(`  Routing: already enabled on zone`)
       } else {
-        await cfFetch(token, `/zones/${zoneId}/email/routing/enable`, { method: 'POST' })
+        await cf(token, 'POST', `/zones/${zoneId}/email/routing/enable`, undefined, OPTS)
         console.log(`  Routing: enabled on zone (MX/SPF records locked in)`)
       }
       routingEnabled = true
@@ -377,19 +339,19 @@ export const cloudflareEmailModule = defineModule({
       // Subdomain routing: provision routing DNS for the subdomain itself
       // (POST /email/routing/dns with the subdomain name). Idempotent: check
       // first via the subdomain query param.
-      const zone = await cfFetch<{ name: string }>(token, `/zones/${zoneId}`)
+      const zone = await cf<{ name: string }>(token, 'GET', `/zones/${zoneId}`, undefined, OPTS)
       if (domain !== zone.name) {
         try {
-          const dns = await cfFetch<Array<Record<string, unknown>>>(
+          const dns = await cf<Array<Record<string, unknown>>>(
             token,
+            'GET',
             `/zones/${zoneId}/email/routing/dns?subdomain=${encodeURIComponent(domain)}`,
+            undefined,
+            OPTS,
           )
           const hasMx = Array.isArray(dns) && dns.some((r) => r.type === 'MX')
           if (!hasMx) {
-            await cfFetch(token, `/zones/${zoneId}/email/routing/dns`, {
-              method: 'POST',
-              body: { name: domain },
-            })
+            await cf(token, 'POST', `/zones/${zoneId}/email/routing/dns`, { name: domain }, OPTS)
             console.log(`  Routing: provisioned DNS for subdomain ${domain}`)
           } else {
             console.log(`  Routing: subdomain ${domain} DNS already provisioned`)
@@ -397,10 +359,7 @@ export const cloudflareEmailModule = defineModule({
         } catch (err) {
           // Some API versions only expose subdomain enrollment via POST; try it.
           if (err instanceof CfError && err.status === 404) {
-            await cfFetch(token, `/zones/${zoneId}/email/routing/dns`, {
-              method: 'POST',
-              body: { name: domain },
-            })
+            await cf(token, 'POST', `/zones/${zoneId}/email/routing/dns`, { name: domain }, OPTS)
             console.log(`  Routing: provisioned DNS for subdomain ${domain}`)
           } else {
             throw err
@@ -410,9 +369,12 @@ export const cloudflareEmailModule = defineModule({
 
       // Routing DNS status for the domain
       try {
-        const routingDns = await cfFetch<Array<Record<string, unknown>>>(
+        const routingDns = await cf<Array<Record<string, unknown>>>(
           token,
+          'GET',
           `/zones/${zoneId}/email/routing/dns${domain !== zone.name ? `?subdomain=${encodeURIComponent(domain)}` : ''}`,
+          undefined,
+          OPTS,
         )
         for (const r of routingDns ?? []) {
           dnsStatus[`${String(r.type ?? 'record')} ${String(r.name ?? domain)}`] = String(
@@ -436,9 +398,12 @@ export const cloudflareEmailModule = defineModule({
       }
 
       // Upsert literal rules for each address.
-      const existingRules = await cfFetch<RoutingRule[]>(
+      const existingRules = await cf<RoutingRule[]>(
         token,
+        'GET',
         `/zones/${zoneId}/email/routing/rules?per_page=50`,
+        undefined,
+        OPTS,
       )
       for (const entry of config.addresses) {
         const email = `${entry.localPart}@${domain}`
@@ -455,28 +420,28 @@ export const cloudflareEmailModule = defineModule({
             r.matchers.some((m) => m.type === 'literal' && m.value === email),
         )
         if (existing) {
-          await cfFetch(token, `/zones/${zoneId}/email/routing/rules/${existing.id}`, {
-            method: 'PUT',
-            body,
-          })
+          await cf(token, 'PUT', `/zones/${zoneId}/email/routing/rules/${existing.id}`, body, OPTS)
           console.log(`  Routing: updated rule for ${email} → ${entry.action}`)
         } else {
-          await cfFetch(token, `/zones/${zoneId}/email/routing/rules`, { method: 'POST', body })
+          await cf(token, 'POST', `/zones/${zoneId}/email/routing/rules`, body, OPTS)
           console.log(`  Routing: created rule for ${email} → ${entry.action}`)
         }
       }
 
       // Catch-all.
       if (config.catchAll) {
-        await cfFetch(token, `/zones/${zoneId}/email/routing/rules/catch_all`, {
-          method: 'PUT',
-          body: {
+        await cf(
+          token,
+          'PUT',
+          `/zones/${zoneId}/email/routing/rules/catch_all`,
+          {
             name: `${RULE_PREFIX}catch-all`,
             enabled: true,
             matchers: [{ type: 'all' }],
             actions: [ruleAction(config.catchAll, ctx.imports, 'catchAll')],
           },
-        })
+          OPTS,
+        )
         console.log(`  Routing: catch-all → ${config.catchAll.action}`)
       }
     }
@@ -509,15 +474,16 @@ export const cloudflareEmailModule = defineModule({
 
     // Remove managed rules (only ones this module named).
     try {
-      const rules = await cfFetch<RoutingRule[]>(
+      const rules = await cf<RoutingRule[]>(
         token,
+        'GET',
         `/zones/${zoneId}/email/routing/rules?per_page=50`,
+        undefined,
+        OPTS,
       )
       for (const r of rules) {
         if (r.name?.startsWith(RULE_PREFIX)) {
-          await cfFetch(token, `/zones/${zoneId}/email/routing/rules/${r.id}`, {
-            method: 'DELETE',
-          })
+          await cf(token, 'DELETE', `/zones/${zoneId}/email/routing/rules/${r.id}`, undefined, OPTS)
           console.log(`  Deleted rule ${r.name}`)
         }
       }
@@ -528,15 +494,18 @@ export const cloudflareEmailModule = defineModule({
     // Reset catch-all to drop (catch_all can't be deleted, only redefined).
     if (config.catchAll) {
       try {
-        await cfFetch(token, `/zones/${zoneId}/email/routing/rules/catch_all`, {
-          method: 'PUT',
-          body: {
+        await cf(
+          token,
+          'PUT',
+          `/zones/${zoneId}/email/routing/rules/catch_all`,
+          {
             name: `${RULE_PREFIX}catch-all`,
             enabled: false,
             matchers: [{ type: 'all' }],
             actions: [{ type: 'drop' }],
           },
-        })
+          OPTS,
+        )
         console.log(`  Catch-all disabled`)
       } catch (err) {
         console.log(`  Catch-all reset skipped: ${(err as Error).message}`)
@@ -545,7 +514,7 @@ export const cloudflareEmailModule = defineModule({
 
     if (config.enableRouting) {
       try {
-        await cfFetch(token, `/zones/${zoneId}/email/routing/disable`, { method: 'POST' })
+        await cf(token, 'POST', `/zones/${zoneId}/email/routing/disable`, undefined, OPTS)
         console.log(`  Routing disabled on zone`)
       } catch (err) {
         console.log(`  Routing disable skipped: ${(err as Error).message}`)
@@ -554,15 +523,22 @@ export const cloudflareEmailModule = defineModule({
 
     if (config.enableSending) {
       try {
-        const subdomains = await cfFetch<SendingSubdomain[]>(
+        const subdomains = await cf<SendingSubdomain[]>(
           token,
+          'GET',
           `/zones/${zoneId}/email/sending/subdomains`,
+          undefined,
+          OPTS,
         )
         const sub = subdomains.find((s) => s.name === domain)
         if (sub) {
-          await cfFetch(token, `/zones/${zoneId}/email/sending/subdomains/${sub.tag}`, {
-            method: 'DELETE',
-          })
+          await cf(
+            token,
+            'DELETE',
+            `/zones/${zoneId}/email/sending/subdomains/${sub.tag}`,
+            undefined,
+            OPTS,
+          )
           console.log(`  Sending subdomain ${domain} deleted`)
         }
       } catch (err) {

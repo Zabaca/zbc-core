@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { defineModule } from '../../src/define-module'
+import { cf } from '../cloudflare-api'
 
 /**
  * cloudflare-token — mints scoped Cloudflare API tokens from ONE root
@@ -29,33 +30,14 @@ import { defineModule } from '../../src/define-module'
  * policy — restricted to `zones` when given (names resolved via GET /zones),
  * else all zones of the account. Account-scoped groups land on an account
  * policy. Unknown names/zones are hard errors before anything mutates.
+ *
+ * The REST envelope is `../cloudflare-api`'s, not this module's. The private
+ * copy that lived here typed `errors` as `{message: string}` — the exact claim
+ * the seam's header documents as false, and the reason a `{code, error}`
+ * failure used to arrive as a bare `HTTP 403`. Note this module's token comes
+ * from secrets.yaml rather than an import, so `resolveApiToken` does not apply
+ * to it; only `cf` does.
  */
-
-const API = 'https://api.cloudflare.com/client/v4'
-
-interface CfEnvelope<T> {
-  success: boolean
-  errors: Array<{ message: string }>
-  result: T
-}
-
-/** Call the CF API; unwrap the envelope; throw the API's message on failure. */
-async function cf<T>(rootToken: string, method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${API}${path}`, {
-    method,
-    headers: {
-      Authorization: `Bearer ${rootToken}`,
-      'Content-Type': 'application/json',
-    },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-  })
-  const payload = (await res.json()) as CfEnvelope<T>
-  if (!payload.success) {
-    const messages = payload.errors?.map((e) => e.message).join('; ') || `HTTP ${res.status}`
-    throw new Error(`Cloudflare API ${method} ${path} failed: ${messages}`)
-  }
-  return payload.result
-}
 
 export interface PermissionGroup {
   id: string
