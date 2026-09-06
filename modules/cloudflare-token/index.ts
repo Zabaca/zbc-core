@@ -13,6 +13,12 @@ import { cf } from '../cloudflare-api'
  * use `zones`. It is the only Cloudflare secret at rest in secrets.yaml;
  * everything else is minted here and flows to dependents through imports.
  *
+ * WHICH root is per-instance: `rootTokenSecret` names the secrets.yaml key,
+ * defaulting to CLOUDFLARE_ROOT_TOKEN. One name serves a repo that mints into
+ * one account; a repo that also deploys into a client's account keeps that
+ * account's root under its own key and points those instances at it. "The only
+ * secret at rest" is per ACCOUNT, not per repo.
+ *
  * Converge semantics: the token is looked up by NAME. Missing → created (the
  * create response carries the value). Present → policies updated, then the
  * value is ROLLED. Rolling on every apply is deliberate: minted values live
@@ -138,6 +144,14 @@ export const cloudflareTokenModule = defineModule({
      * to grant zone-scoped groups on all zones of the account.
      */
     zones: z.array(z.string()).default([]),
+    /**
+     * Which secrets.yaml key holds the root credential this instance mints
+     * from. Defaults to CLOUDFLARE_ROOT_TOKEN — one name is enough until a repo
+     * has to mint into two Cloudflare accounts (its own and a client's), at
+     * which point both roots live in the same environment under different keys
+     * and each instance names the one it belongs to.
+     */
+    rootTokenSecret: z.string().default('CLOUDFLARE_ROOT_TOKEN'),
   }),
   outputs: z.object({
     tokenId: z.string(),
@@ -149,7 +163,7 @@ export const cloudflareTokenModule = defineModule({
     s3SecretAccessKey: z.string(),
   }),
   async apply(config, ctx) {
-    const rootToken = ctx.secret('CLOUDFLARE_ROOT_TOKEN')
+    const rootToken = ctx.secret(config.rootTokenSecret)
 
     // 1. Resolve permission names → group ids. Fail fast before any mutation.
     const available = await cf<PermissionGroup[]>(
@@ -230,7 +244,7 @@ export const cloudflareTokenModule = defineModule({
     return { tokenId, tokenValue, ...deriveS3Credentials(tokenId, tokenValue) }
   },
   async destroy(config, ctx) {
-    const rootToken = ctx.secret('CLOUDFLARE_ROOT_TOKEN')
+    const rootToken = ctx.secret(config.rootTokenSecret)
     const existing = await findTokenByName(rootToken, config.accountId, config.tokenName)
     if (!existing) {
       console.log(`  Token "${config.tokenName}" already absent`)

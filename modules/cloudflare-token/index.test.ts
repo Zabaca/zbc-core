@@ -452,3 +452,77 @@ describe('a failure in the undocumented shape', () => {
     expect(byMethod(calls, 'POST', '/accounts/acct-1/tokens')).toHaveLength(0)
   })
 })
+
+// ── naming the root credential ──────────────────────────────────────────────
+//
+// The root secret's NAME was a constant, which is fine until one repo has to
+// mint tokens in two Cloudflare accounts — the consumer's own and a client's.
+// Both roots then live in the same secrets.yaml under different keys, and there
+// was nowhere to say which one an instance mints from. `rootTokenSecret` is that
+// place; its default keeps every existing instance on CLOUDFLARE_ROOT_TOKEN.
+
+describe('rootTokenSecret — which root credential an instance mints from', () => {
+  test('a named secret is the Bearer on every call to the API', async () => {
+    const { error, calls } = await runApply({
+      config: { rootTokenSecret: 'LEEANDCO_ROOT_TOKEN' },
+      secrets: { LEEANDCO_ROOT_TOKEN: 'client-root-tok' },
+    })
+    expect(error).toBeUndefined()
+    expect(calls.length).toBeGreaterThan(0)
+    for (const c of calls) expect(c.authorization).toBe('Bearer client-root-tok')
+  })
+  test('naming nothing still mints from CLOUDFLARE_ROOT_TOKEN, with a second root present', async () => {
+    const { error, calls } = await runApply({
+      secrets: { LEEANDCO_ROOT_TOKEN: 'client-root-tok' },
+    })
+    expect(error).toBeUndefined()
+    expect(calls.length).toBeGreaterThan(0)
+    for (const c of calls) expect(c.authorization).toBe('Bearer root-tok')
+  })
+
+  test('destroy deletes with the named root, not the default one', async () => {
+    const stub = installFetchStub({
+      permissionGroups: GROUPS,
+      existingTokens: [{ id: 'tok-1', name: 'zbc-test-token' }],
+    })
+    const config = cloudflareTokenModule.configSchema.parse({
+      accountId: 'acct-1',
+      tokenName: 'zbc-test-token',
+      permissions: ['Workers Scripts Write'],
+      rootTokenSecret: 'LEEANDCO_ROOT_TOKEN',
+    })
+    await cloudflareTokenModule.destroy!(config, {
+      secrets: { CLOUDFLARE_ROOT_TOKEN: 'root-tok', LEEANDCO_ROOT_TOKEN: 'client-root-tok' },
+      imports: {},
+      projectRoot: '/tmp',
+    })
+    const deletes = byMethod(stub.calls, 'DELETE', '/tokens/tok-1')
+    expect(deletes).toHaveLength(1)
+    for (const c of stub.calls) expect(c.authorization).toBe('Bearer client-root-tok')
+  })
+
+  test('a named secret that is absent fails fast, naming it and not the default', async () => {
+    const stub = installFetchStub({ permissionGroups: GROUPS })
+    const config = cloudflareTokenModule.configSchema.parse({
+      accountId: 'acct-1',
+      tokenName: 'zbc-test-token',
+      permissions: ['Workers Scripts Write'],
+      rootTokenSecret: 'LEEANDCO_ROOT_TOKEN',
+    })
+    let error: Error | undefined
+    try {
+      await cloudflareTokenModule.apply(config, {
+        secrets: { CLOUDFLARE_ROOT_TOKEN: 'root-tok' },
+        imports: {},
+        projectRoot: '/tmp',
+      })
+    } catch (e) {
+      error = e as Error
+    }
+    expect(error?.message).toContain('LEEANDCO_ROOT_TOKEN')
+    // The default being present must not satisfy the instance, and must not be
+    // what the error talks about — that would send someone to the wrong key.
+    expect(error?.message).not.toContain('CLOUDFLARE_ROOT_TOKEN')
+    expect(stub.calls).toHaveLength(0)
+  })
+})
