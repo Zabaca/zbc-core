@@ -1,6 +1,8 @@
 export { defineModule } from './define-module'
 export { defineConfig } from './config'
 export { createApplyContext, ensureApplyContext, resolveOutput, resolveSecret } from './context'
+export { createTestContext } from './testing'
+export type { TestApplyContext, TestContextOptions } from './testing'
 export type {
   ModuleDefinition,
   ModuleInstance,
