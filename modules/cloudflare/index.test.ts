@@ -18,9 +18,23 @@ import { cloudflareModule, routeUrl } from './index'
  */
 
 /**
- * POSIX-sh stub. Records each call (argv + stdin) to $STUB_LOG, and for `deploy`
- * prints a `Deployed … triggers` line + a *.workers.dev URL so the module's
- * success-theater guard and URL parse both pass.
+ * POSIX-sh stub. Records each call (argv + stdin) to $STUB_LOG, and prints what
+ * wrangler 4.129.0 prints — including, crucially, WHICH SCRIPT each subcommand
+ * resolved from the flags it was handed, since that is the thing under test:
+ *
+ *   - `deploy` → `Deployed <script> triggers` + a `<script>.workers.dev` URL,
+ *     where `<script>` is `--name` when given, else `<config name>-<--env>`,
+ *     else the config name (`my-worker`). `deploy` honours `--name` on its own.
+ *   - `secret put` → `Creating the secret for the Worker "<script>"` and
+ *     `Success! Uploaded secret <KEY>`, where `<script>` comes from wrangler's
+ *     `getLegacyScriptName`: `name && env ? name-env : name ?? config.name`.
+ *     That last rule is the bug being tested — a stub that ignored it would let
+ *     a module passing BOTH flags look correct.
+ *
+ * `$STUB_SECRET_SILENT` makes `secret put` print nothing (exit 0 anyway, as
+ * wrangler does when it silently creates a draft worker) and
+ * `$STUB_SECRET_WORKER` forces the script in the `Creating …` line, so the
+ * mismatch guard can be exercised against a module that is already correct.
  */
 const STUB_WRANGLER = `#!/bin/sh
 input="$(cat)"
@@ -31,10 +45,40 @@ input="$(cat)"
   printf 'stdin=%s\\n' "$input"
   printf 'CALL>>>\\n'
 } >> "$STUB_LOG"
+
+# Recover the --name / --env this call was handed.
+flag_name=""
+flag_env=""
+prev=""
+for arg in "$@"; do
+  case "$prev" in
+    --name) flag_name="$arg" ;;
+    --env) flag_env="$arg" ;;
+  esac
+  prev="$arg"
+done
+
 if [ "$1" = "deploy" ]; then
+  # deploy: --name wins outright; otherwise the legacy <config name>-<env>.
+  if [ -n "$flag_name" ]; then script="$flag_name"
+  elif [ -n "$flag_env" ]; then script="my-worker-$flag_env"
+  else script=my-worker
+  fi
   printf 'Total Upload: 1 KiB / gzip: 1 KiB\\n'
-  printf 'Deployed my-worker triggers (1.23 sec)\\n'
-  printf 'https://my-worker.workers.dev\\n'
+  printf 'Deployed %s triggers (1.23 sec)\\n' "$script"
+  printf 'https://%s.workers.dev\\n' "$script"
+fi
+
+if [ "$1" = "secret" ] && [ "$2" = "put" ] && [ -z "$STUB_SECRET_SILENT" ]; then
+  # secret put: wrangler's getLegacyScriptName CONCATENATES name and env.
+  if [ -n "$flag_name" ] && [ -n "$flag_env" ]; then script="$flag_name-$flag_env"
+  elif [ -n "$flag_name" ]; then script="$flag_name"
+  elif [ -n "$flag_env" ]; then script="my-worker-$flag_env"
+  else script=my-worker
+  fi
+  [ -z "$STUB_SECRET_WORKER" ] || script="$STUB_SECRET_WORKER"
+  printf 'Creating the secret for the Worker "%s"\\n' "$script"
+  printf 'Success! Uploaded secret %s\\n' "$3"
 fi
 exit 0
 `
@@ -57,9 +101,12 @@ function parseCalls(log: string): WranglerCall[] {
 }
 
 const createdRoots: string[] = []
+const stubEnvKeys = new Set<string>()
 
 afterEach(() => {
   delete process.env.STUB_LOG
+  for (const key of stubEnvKeys) delete process.env[key]
+  stubEnvKeys.clear()
   for (const root of createdRoots.splice(0)) {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -72,6 +119,8 @@ async function runApply(opts: {
   /** Replace the secrets map entirely (no default CLOUDFLARE_API_TOKEN). */
   bareSecrets?: Record<string, string>
   imports?: Record<string, unknown>
+  /** Extra env for the stub (STUB_SECRET_SILENT / STUB_SECRET_WORKER). */
+  stubEnv?: Record<string, string>
 }): Promise<{ result?: { deployUrl: string }; error?: Error; calls: WranglerCall[] }> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-stub-'))
   createdRoots.push(root)
@@ -83,6 +132,10 @@ async function runApply(opts: {
 
   const logPath = path.join(root, 'calls.log')
   process.env.STUB_LOG = logPath
+  for (const [k, v] of Object.entries(opts.stubEnv ?? {})) {
+    process.env[k] = v
+    stubEnvKeys.add(k)
+  }
 
   // Parse through the schema so defaults (workerSecrets/workerVars → []) and the
   // union validation apply exactly as the engine would.
@@ -376,5 +429,82 @@ describe('cloudflare destroy — the same credential rule as apply', () => {
     const { error, calls } = await runDestroy({ bareSecrets: {} })
     expect(error?.message).toContain('CLOUDFLARE_API_TOKEN')
     expect(calls).toHaveLength(0)
+  })
+})
+
+/**
+ * Which script a secret lands on.
+ *
+ * wrangler's secret commands resolve their target through `getLegacyScriptName`
+ * — `args.name && args.env ? `${args.name}-${args.env}` : args.name ?? config.name`
+ * — so passing BOTH flags targets `<workerName>-<wranglerEnv>`, a script no
+ * deploy ever created. `deploy` and `delete` do not go through that function and
+ * honour `--name` on its own, which is why only the secret push was wrong.
+ */
+describe('cloudflare apply — a secret lands on the script that was deployed', () => {
+  test('workerName + wranglerEnv → secret put targets --name alone', async () => {
+    const { error, calls } = await runApply({
+      config: {
+        workerName: 'foothill-metabolic',
+        wranglerEnv: 'production',
+        workerSecrets: ['GCAL_TOKEN'],
+      },
+      secrets: { GCAL_TOKEN: 'g-tok' },
+    })
+    expect(error).toBeUndefined()
+    const secret = secretCalls(calls)[0]
+    // Both flags together would target `foothill-metabolic-production`.
+    expect(secret.argv).toEqual(['secret', 'put', 'GCAL_TOKEN', '--name', 'foothill-metabolic'])
+    // The deploy call is unchanged: `deploy` honours --name alongside --env.
+    expect(deployCall(calls)!.argv).toContain('--env')
+    expect(deployCall(calls)!.argv).toContain('--name')
+  })
+
+  // Regression guard rather than fix coverage: with no workerName the argv is
+  // what it always was. It is here because the fix reorders the two branches,
+  // and this is the branch that must keep working.
+  test('wranglerEnv alone still selects the named environment', async () => {
+    const { error, calls } = await runApply({
+      config: { wranglerEnv: 'preview', workerSecrets: ['MY_SECRET'] },
+      secrets: { MY_SECRET: 's3cr3t' },
+    })
+    expect(error).toBeUndefined()
+    expect(secretCalls(calls)[0].argv).toEqual(['secret', 'put', 'MY_SECRET', '--env', 'preview'])
+  })
+})
+
+/**
+ * The success-theater guard the deploy path already had, on the secret push.
+ *
+ * `wrangler secret put` exits 0 even when the script it targeted does not
+ * exist — it creates a draft worker and reports success — so the exit code
+ * alone says nothing about where the secret landed.
+ */
+describe('cloudflare apply — a silent secret push is a failed apply', () => {
+  test('secret put exits 0 with no confirmation → apply throws, naming the secret', async () => {
+    const { error } = await runApply({
+      config: { workerSecrets: ['MY_SECRET'] },
+      secrets: { MY_SECRET: 's3cr3t' },
+      stubEnv: { STUB_SECRET_SILENT: '1' },
+    })
+    expect(error).toBeDefined()
+    expect(error!.message).toContain('MY_SECRET')
+  })
+
+  test('secret put reporting a different worker than the deploy → apply throws, naming both', async () => {
+    const { error } = await runApply({
+      config: { workerName: 'foothill-metabolic', workerSecrets: ['GCAL_TOKEN'] },
+      secrets: { GCAL_TOKEN: 'g-tok' },
+      // The deploy created `foothill-metabolic`; wrangler reports it wrote the
+      // secret to the name the OLD both-flags call would have produced. The
+      // module cannot generate this any more, so the stub forces it — the guard
+      // is what stands between a future regression and another silent apply.
+      stubEnv: { STUB_SECRET_WORKER: 'foothill-metabolic-production' },
+    })
+    expect(error).toBeDefined()
+    // Names the script it wrote to, the script the deploy created, and the key.
+    expect(error!.message).toContain('"foothill-metabolic-production"')
+    expect(error!.message).toContain('"foothill-metabolic"')
+    expect(error!.message).toContain('GCAL_TOKEN')
   })
 })

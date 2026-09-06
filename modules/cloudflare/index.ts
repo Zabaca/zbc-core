@@ -36,6 +36,10 @@ import type { ApplyContext } from '../../src/types'
  *   - `workerName` renames the deployed worker (`--name`), which is what powers
  *     per-PR preview workers (`zbc-<app>-pr-<N>`). The `*.workers.dev` deploy-URL
  *     regex still matches a renamed worker's URL.
+ * Setting both is legal and targets the `--name` worker: `deploy` and `delete`
+ * honour `--name` on its own, and the secret push passes `--name` ALONE for the
+ * same target — wrangler's secret commands would otherwise concatenate the two
+ * into a `<workerName>-<wranglerEnv>` script nothing deployed (see step 4).
  *
  * IMPORT SYNC: `workerSecrets` and `workerVars` entries can be either a plain
  * name (resolved from this environment's secrets.yaml, exactly as before) or a
@@ -380,12 +384,18 @@ export const cloudflareModule = defineModule({
      */
     immediateContainerRollout: z.boolean().default(false),
     /**
-     * Wrangler named environment (`--env <name>`). When set, deploy and every
-     * `secret put` target the matching `env.<name>` block in the package's
-     * wrangler.jsonc, so a non-production zbc environment (e.g. `preview`) can
-     * ship a DISTINCT worker (own name/domain/bindings) from the same package —
-     * without a separate wrangler config. Omit for the top-level (production)
-     * worker.
+     * Wrangler named environment (`--env <name>`). When set, deploy targets the
+     * matching `env.<name>` block in the package's wrangler.jsonc, so a
+     * non-production zbc environment (e.g. `preview`) can ship a DISTINCT worker
+     * (own name/domain/bindings) from the same package — without a separate
+     * wrangler config. Omit for the top-level (production) worker.
+     *
+     * The secret push follows only when `workerName` is NOT set: with both,
+     * wrangler's secret commands would concatenate the two into a
+     * `<workerName>-<wranglerEnv>` script (see step 4 of `apply`), so `--name`
+     * is passed alone and the push resolves the TOP-LEVEL wrangler config. An
+     * `env.<name>` block that overrides `account_id` is therefore not honoured
+     * on the push — put per-environment accounts in the instance's `accountId`.
      */
     wranglerEnv: z.string().optional(),
     /**
@@ -534,10 +544,44 @@ export const cloudflareModule = defineModule({
     //    this point. Value piped via stdin so it never lands in a command
     //    string or the log.
     for (const { name, value } of resolvedSecrets) {
+      // --name and --env are mutually exclusive HERE, unlike on deploy: the
+      // secret commands resolve their target through wrangler's
+      // `getLegacyScriptName`, which CONCATENATES the two —
+      //   args.name && args.env ? `${args.name}-${args.env}` : args.name ?? config.name
+      // — so passing both pushed every secret to `<workerName>-<wranglerEnv>`,
+      // a script no deploy ever created. `secret put` then creates that name as
+      // a DRAFT worker and exits 0, which is why it went unnoticed in
+      // production twice. `--name` names the script outright, so it wins.
       const secretArgs = ['secret', 'put', name]
-      if (config.wranglerEnv) secretArgs.push('--env', config.wranglerEnv)
       if (config.workerName) secretArgs.push('--name', config.workerName)
-      wrangler(workdir, secretArgs, env, value)
+      else if (config.wranglerEnv) secretArgs.push('--env', config.wranglerEnv)
+      const secretOut = wrangler(workdir, secretArgs, env, value)
+      // Same success-theater guard as the deploy above, for the same reason:
+      // `secret put` exits 0 whether or not the script it targeted existed —
+      // when it did not, wrangler CREATES it as a draft worker and reports
+      // success. The exit code therefore says nothing about where the secret
+      // landed; wrangler's own two lines do. (The value is never echoed by
+      // wrangler, so quoting its output here cannot leak the secret.)
+      if (!secretOut.includes(`Uploaded secret ${name}`)) {
+        throw new Error(
+          `wrangler secret put ${name} exited 0 but printed no "Uploaded secret ${name}" confirmation:\n${secretOut}`,
+        )
+      }
+      // …and when wrangler names the script it wrote to, it must be the one the
+      // deploy just confirmed. Two deliberate narrowings, both to fail only on
+      // the real thing: checked only when the line is present (a wrangler that
+      // stops printing it loses the check rather than failing every apply), and
+      // only when `workerName` pins the script outright — without it the name
+      // comes from the wrangler config, which is free to decorate it per
+      // environment, and this would start reading as a mismatch.
+      const targetMatch = config.workerName
+        ? secretOut.match(/Creating the secret for the Worker "([^"]+)"/)
+        : null
+      if (targetMatch && targetMatch[1] !== workerName) {
+        throw new Error(
+          `wrangler pushed secret ${name} to Worker "${targetMatch[1]}", but the deploy created "${workerName}". The secret is on a different script than the code.`,
+        )
+      }
       console.log(`  Set Worker secret: ${name}`)
     }
 
@@ -560,7 +604,11 @@ export const cloudflareModule = defineModule({
     const workdir = path.resolve(ctx.projectRoot, config.workdir)
     // `wrangler delete` removes the Worker (and its DO/container). Non-fatal if
     // already gone. --env / --name target the same worker `apply` deployed
-    // (named environment and/or per-PR preview name).
+    // (named environment and/or per-PR preview name). Both flags together are
+    // safe HERE, unlike on the secret push: `getLegacyScriptName` — the helper
+    // that concatenates them — is called only by wrangler's `secret` family
+    // (`put`/`delete`/`list`/`bulk` and their `versions secret` twins; verified
+    // by reading wrangler 4.129.0's bundle), never by `deploy` or `delete`.
     try {
       const deleteArgs = ['delete', '--force']
       if (config.wranglerEnv) deleteArgs.push('--env', config.wranglerEnv)
