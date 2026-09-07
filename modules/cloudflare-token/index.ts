@@ -110,6 +110,67 @@ export function deriveS3Credentials(
   }
 }
 
+/**
+ * A granted READ permission group, and the call that proves the minted token
+ * may actually exercise it.
+ *
+ * Read groups only, and that is the whole design. leeandco's token carried
+ * `D1 Read` and `D1 Write` and was refused by D1 with error 10000 about five
+ * seconds after it was minted; write does not imply read on Cloudflare, so a
+ * write-only grant has no safe probe here — asking anyway would fail forever on
+ * a token that is working perfectly. What is left for that case is
+ * the account-owned token verify (see `readinessProbes`), which is a weaker claim,
+ * honestly weaker: measured across three trials on 2026-08-15 it answered 200
+ * at 112/111/202 ms while the scope-gated call was still refusing at
+ * 1621/610/808 ms.
+ *
+ * Only account-scoped groups are here. A zone-scoped probe needs a zone id, and
+ * the zone ids this apply resolved are not in its outputs.
+ *
+ * Extending it is adding a line. A permission with no line simply contributes
+ * no probe — the table is allowed to be incomplete, and never wrong.
+ */
+/*
+ * A Map rather than an object literal, for one reason: a permission name is
+ * untrusted input as far as this lookup is concerned, and `{}[name]` finds
+ * `Object.prototype`'s keys. A permission called `constructor` would hit a real
+ * function and probe a nonsense path — breaking the promise made just above,
+ * that a permission with no entry contributes no probe. A Map has no prototype
+ * chain to fall through, and its `get` returns `undefined` honestly, which is
+ * also what `noUncheckedIndexedAccess` wants to see checked.
+ */
+const READ_PROBES = new Map<string, (accountId: string) => string>([
+  ['D1 Read', (id) => `/accounts/${id}/d1/database`],
+  ['Workers Scripts Read', (id) => `/accounts/${id}/workers/scripts`],
+  ['Workers KV Storage Read', (id) => `/accounts/${id}/storage/kv/namespaces`],
+  ['Workers R2 Storage Read', (id) => `/accounts/${id}/r2/buckets`],
+  ['Account Settings Read', (id) => `/accounts/${id}`],
+  ['Zone Read', () => `/zones?per_page=1`],
+])
+
+/**
+ * The calls that prove a minted token usable, given what it was granted.
+ *
+ * Falls back to verifying the token when nothing granted has a probe — the
+ * weakest honest proof, and still better than none: it catches a token id the
+ * API does not yet acknowledge. Pure; exported for tests.
+ */
+export function readinessProbes(
+  permissions: readonly string[],
+  accountId: string,
+): Array<{ permission: string; path: string }> {
+  const probes = permissions.flatMap((permission) => {
+    const build = READ_PROBES.get(permission)
+    return build === undefined ? [] : [{ permission, path: build(accountId) }]
+  })
+  // `/accounts/{id}/tokens/verify`, not `/user/tokens/verify`: this module
+  // creates ACCOUNT-owned tokens (`POST /accounts/{id}/tokens`), and the
+  // user-scoped verify is a different endpoint for a different kind of token.
+  return probes.length > 0
+    ? probes
+    : [{ permission: 'token authentication', path: `/accounts/${accountId}/tokens/verify` }]
+}
+
 /** Account-owned token with the given name, if any. Single page by design —
  * an account approaching 500 tokens has bigger problems than this lookup. */
 async function findTokenByName(
@@ -242,6 +303,36 @@ export const cloudflareTokenModule = defineModule({
     }
 
     return { tokenId, tokenValue, ...deriveS3Credentials(tokenId, tokenValue) }
+  },
+  /**
+   * A minted Cloudflare token authenticates before it can act, and the window
+   * is seconds wide. The engine holds this token's outputs at every `imports`
+   * edge until the probe below passes — so a dependent module's first call with
+   * it is never the one that discovers this.
+   *
+   * The probe runs as the MINTED token, not as the root: the root's own
+   * permissions are irrelevant to whether the new one works, and probing with
+   * it would pass instantly and prove nothing.
+   */
+  ready: {
+    proves: 'the minted token can exercise the read permissions it was granted',
+    timeoutMs: 30_000,
+    intervalMs: 2_000,
+    async probe(outputs, config) {
+      for (const { permission, path } of readinessProbes(config.permissions, config.accountId)) {
+        try {
+          await cf(outputs.tokenValue, 'GET', path)
+        } catch (err) {
+          // Which grant is still being refused is the fact the operator needs,
+          // and `cf`'s message carries only the path. A token refused on one of
+          // several grants is the interesting case: it reads as working.
+          throw new Error(
+            `"${permission}" refused: ${err instanceof Error ? err.message : String(err)}`,
+            { cause: err },
+          )
+        }
+      }
+    },
   },
   async destroy(config, ctx) {
     const rootToken = ctx.secret(config.rootTokenSecret)

@@ -1,6 +1,13 @@
 import type { z } from 'zod'
 import { ensureApplyContext } from './context'
-import type { ApplyFn, DestroyFn, ModuleDefinition, ModuleInstance, InstanceOptions } from './types'
+import type {
+  ApplyFn,
+  DestroyFn,
+  InstanceOptions,
+  ModuleDefinition,
+  ModuleInstance,
+  ReadinessDeclaration,
+} from './types'
 
 interface DefineModuleOptions<TConfig extends z.ZodType, TOutputs extends z.ZodType> {
   name: string
@@ -8,6 +15,8 @@ interface DefineModuleOptions<TConfig extends z.ZodType, TOutputs extends z.ZodT
   outputs: TOutputs
   apply: ApplyFn<z.infer<TConfig>, z.infer<TOutputs>>
   destroy?: DestroyFn<z.infer<TConfig>>
+  /** What proves the applied resource is usable — see `ReadinessDeclaration`. */
+  ready?: ReadinessDeclaration<z.infer<TConfig>, z.infer<TOutputs>>
 }
 
 /**
@@ -56,6 +65,13 @@ export function defineModule<TConfig extends z.ZodType, TOutputs extends z.ZodTy
     // passed through untouched.
     apply: (config, ctx) => opts.apply(config, ensureApplyContext(ctx)),
     destroy: opts.destroy && ((config, ctx) => opts.destroy!(config, ensureApplyContext(ctx))),
+    // A probe is a module body like any other: it reaches the provider, and it
+    // reads its credential the same way `apply` did. So it gets the same
+    // context, normalized in the same place.
+    ready: opts.ready && {
+      ...opts.ready,
+      probe: (outputs, config, ctx) => opts.ready!.probe(outputs, config, ensureApplyContext(ctx)),
+    },
     instance(instanceOpts: InstanceOptions<TConfig>): ModuleInstance<TOutputs> {
       return {
         name: instanceOpts.name,

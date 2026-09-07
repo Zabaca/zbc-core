@@ -75,6 +75,18 @@ function installFetchStub(state: StubState): { calls: RecordedCall[] } {
     if (method === 'DELETE' && /\/tokens\/[^/]+$/.test(path)) {
       return respond(envelope({ id: path.split('/').pop() }))
     }
+    // The readiness probe's endpoints. An account with none of a resource
+    // answers 200 with an empty list, which is a pass — the probe asks whether
+    // the token may look, not whether there is anything to see.
+    if (method === 'GET' && path.endsWith('/tokens/verify')) {
+      return respond(envelope({ status: 'active' }))
+    }
+    if (
+      method === 'GET' &&
+      /\/(d1\/database|workers\/scripts|r2\/buckets|storage\/kv\/namespaces)$/.test(path)
+    ) {
+      return respond(envelope([]))
+    }
     return respond({
       success: false,
       errors: [{ message: `no stub route: ${method} ${path}` }],
@@ -524,5 +536,108 @@ describe('rootTokenSecret — which root credential an instance mints from', () 
     // what the error talks about — that would send someone to the wrong key.
     expect(error?.message).not.toContain('CLOUDFLARE_ROOT_TOKEN')
     expect(stub.calls).toHaveLength(0)
+  })
+})
+
+// ── readiness: a token that authenticates and cannot yet act ────────────────
+//
+// leeandco, 2026-08-14: a freshly minted token carrying `D1 Read`/`D1 Write`
+// was refused by D1 with error 10000, and accepted about five seconds later.
+// Measured across three trials the next day, `/tokens/verify` answered 200 at
+// 112/111/202 ms while the scope-gated call was still refusing at
+// 1621/610/808 ms — so verifying the token proves the wrong thing. The probe
+// has to exercise a capability the token was actually granted, and a READ one,
+// because write does not imply read on Cloudflare.
+//
+// The retrying is the engine's (see the readiness gate in the CLI engine); what
+// is asserted here is what the module declares: which call, with which token.
+
+describe('cloudflare-token readiness', () => {
+  /** Apply, then run the module's own probe over the outputs it emitted. */
+  async function applyThenProbe(opts: {
+    config?: Record<string, unknown>
+    state?: StubState
+  }): Promise<{ error?: Error; probeCalls: RecordedCall[] }> {
+    const applied = await runApply(opts)
+    if (applied.error) throw applied.error
+    const stub = installFetchStub({ permissionGroups: GROUPS, ...opts.state })
+    const config = cloudflareTokenModule.configSchema.parse({
+      accountId: 'acct-1',
+      tokenName: 'zbc-test-token',
+      permissions: ['Workers Scripts Write'],
+      ...opts.config,
+    })
+    let error: Error | undefined
+    try {
+      await cloudflareTokenModule.ready!.probe(applied.result as never, config, {
+        secrets: { CLOUDFLARE_ROOT_TOKEN: 'root-tok' },
+        imports: {},
+        projectRoot: '/tmp',
+      })
+    } catch (e) {
+      error = e as Error
+    }
+    return { error, probeCalls: stub.calls }
+  }
+
+  const D1_GROUPS = [
+    ...GROUPS,
+    { id: 'pg-d1-read', name: 'D1 Read', scopes: ['com.cloudflare.api.account'] },
+    { id: 'pg-d1-write', name: 'D1 Write', scopes: ['com.cloudflare.api.account'] },
+  ]
+
+  test('probes the granted read capability, not /tokens/verify', async () => {
+    const { error, probeCalls } = await applyThenProbe({
+      config: { permissions: ['D1 Read', 'D1 Write'] },
+      state: { permissionGroups: D1_GROUPS, createdValue: 'v-minted' },
+    })
+    expect(error).toBeUndefined()
+    expect(probeCalls.map((c) => `${c.method} ${new URL(c.url).pathname}`)).toEqual([
+      'GET /client/v4/accounts/acct-1/d1/database',
+    ])
+  })
+
+  test('probes with the MINTED token — the root would pass while the token cannot act', async () => {
+    const { probeCalls } = await applyThenProbe({
+      config: { permissions: ['D1 Read'] },
+      state: { permissionGroups: D1_GROUPS, createdValue: 'v-minted' },
+    })
+    expect(probeCalls.length).toBeGreaterThan(0)
+    for (const call of probeCalls) expect(call.authorization).toBe('Bearer v-minted')
+  })
+
+  test('a 10000 refusal is a failed probe, carrying the code the engine will report', async () => {
+    const { error } = await applyThenProbe({
+      config: { permissions: ['D1 Read'] },
+      state: {
+        permissionGroups: D1_GROUPS,
+        createdValue: 'v-minted',
+        override: (method, url) =>
+          method === 'GET' && url.includes('/d1/database')
+            ? {
+                success: false,
+                result: null,
+                errors: [{ code: 10000, message: 'Authentication error' }],
+              }
+            : undefined,
+      },
+    })
+    expect(error?.message).toContain('10000')
+    expect(error?.message).toContain('Authentication error')
+    // …and WHICH grant is still refused, which is what the operator acts on.
+    expect(error?.message).toContain('"D1 Read"')
+  })
+
+  test('write-only permissions fall back to verifying the token — the weakest honest proof', async () => {
+    const { error, probeCalls } = await applyThenProbe({
+      config: { permissions: ['Workers Scripts Write'] },
+      state: { createdValue: 'v-minted' },
+    })
+    expect(error).toBeUndefined()
+    // Account-owned, because that is what this module mints — the user-scoped
+    // verify is a different endpoint for a different kind of token.
+    expect(probeCalls.map((c) => new URL(c.url).pathname)).toEqual([
+      '/client/v4/accounts/acct-1/tokens/verify',
+    ])
   })
 })

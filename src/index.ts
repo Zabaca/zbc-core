@@ -12,4 +12,6 @@ export type {
   OutputOptions,
   SecretOptions,
   InstanceOptions,
+  ReadyFn,
+  ReadinessDeclaration,
 } from './types'
