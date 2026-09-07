@@ -49,14 +49,27 @@ input="$(cat)"
 # Recover the --name / --env this call was handed.
 flag_name=""
 flag_env=""
+flag_config=""
 prev=""
 for arg in "$@"; do
   case "$prev" in
     --name) flag_name="$arg" ;;
     --env) flag_env="$arg" ;;
+    --config) flag_config="$arg" ;;
   esac
   prev="$arg"
 done
+
+# Record the config file wrangler was actually handed, contents and all: the
+# generated copy is deleted the moment deploy returns, so this log is the only
+# place the patched bindings can be observed from outside the module.
+if [ -n "$flag_config" ]; then
+  {
+    printf '<<<CFG\n'
+    cat "$flag_config"
+    printf '\nCFG>>>\n'
+  } >> "$STUB_LOG"
+fi
 
 if [ "$1" = "deploy" ]; then
   # deploy: --name wins outright; otherwise the legacy <config name>-<env>.
@@ -100,6 +113,21 @@ function parseCalls(log: string): WranglerCall[] {
   return calls
 }
 
+/**
+ * The `--config` files the stub was handed, parsed, in call order. Plain JSON:
+ * the module writes the generated copy with `JSON.stringify`, so comments and
+ * trailing commas are already gone by the time wrangler sees it.
+ */
+function parseConfigs(log: string): Array<Record<string, unknown>> {
+  const configs: Array<Record<string, unknown>> = []
+  const re = /<<<CFG\n([\s\S]*?)\nCFG>>>/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(log)) !== null) {
+    configs.push(JSON.parse(m[1]) as Record<string, unknown>)
+  }
+  return configs
+}
+
 const createdRoots: string[] = []
 const stubEnvKeys = new Set<string>()
 
@@ -121,7 +149,14 @@ async function runApply(opts: {
   imports?: Record<string, unknown>
   /** Extra env for the stub (STUB_SECRET_SILENT / STUB_SECRET_WORKER). */
   stubEnv?: Record<string, string>
-}): Promise<{ result?: { deployUrl: string }; error?: Error; calls: WranglerCall[] }> {
+  /** Written to `<workdir>/wrangler.jsonc` — the package's own wrangler config. */
+  wranglerConfig?: string
+}): Promise<{
+  result?: { deployUrl: string }
+  error?: Error
+  calls: WranglerCall[]
+  configs: Array<Record<string, unknown>>
+}> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-stub-'))
   createdRoots.push(root)
   const binDir = path.join(root, 'node_modules', '.bin')
@@ -129,6 +164,10 @@ async function runApply(opts: {
   const stubPath = path.join(binDir, 'wrangler')
   fs.writeFileSync(stubPath, STUB_WRANGLER, { mode: 0o755 })
   fs.chmodSync(stubPath, 0o755)
+
+  if (opts.wranglerConfig !== undefined) {
+    fs.writeFileSync(path.join(root, 'wrangler.jsonc'), opts.wranglerConfig)
+  }
 
   const logPath = path.join(root, 'calls.log')
   process.env.STUB_LOG = logPath
@@ -158,7 +197,7 @@ async function runApply(opts: {
     error = e as Error
   }
   const log = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : ''
-  return { result, error, calls: parseCalls(log) }
+  return { result, error, calls: parseCalls(log), configs: parseConfigs(log) }
 }
 
 /** Run `destroy` against the same stubbed workdir; capture calls even on throw. */
@@ -506,5 +545,207 @@ describe('cloudflare apply — a silent secret push is a failed apply', () => {
     expect(error!.message).toContain('"foothill-metabolic-production"')
     expect(error!.message).toContain('"foothill-metabolic"')
     expect(error!.message).toContain('GCAL_TOKEN')
+  })
+})
+
+/**
+ * Bindings: an imported instance's output reaching the file wrangler reads.
+ *
+ * `workerSecrets`/`workerVars` carry an output into the worker's ENV; neither
+ * can reach a BINDING, because a binding is a field in the wrangler config and
+ * wrangler has no CLI flag for it. Four consumers wrote a `d1` module and every
+ * one still hardcoded `database_id` in `wrangler.jsonc` for exactly that reason.
+ *
+ * These assert on the config file the stub was actually handed — the generated
+ * copy is deleted the moment deploy returns, so the log is the only outside
+ * view of it.
+ */
+describe('cloudflare apply — bindings resolve into the wrangler config', () => {
+  const D1_CONFIG = `{
+  // A package's own wrangler config declares the binding; the id is not its business.
+  "name": "my-worker",
+  "d1_databases": [{ "binding": "DB", "database_name": "app", "database_id": "PLACEHOLDER" }],
+}`
+
+  test('{ type, binding, field, from, output } sets the field from the import', async () => {
+    const { error, calls, configs } = await runApply({
+      wranglerConfig: D1_CONFIG,
+      config: {
+        bindings: [
+          {
+            type: 'd1_databases',
+            binding: 'DB',
+            field: 'database_id',
+            from: 'app-db',
+            output: 'databaseId',
+          },
+        ],
+      },
+      imports: { 'app-db': { databaseId: 'ffb0c2f6-1e2a-4c1e-9a4a-6f0a2c8d1111' } },
+    })
+    expect(error).toBeUndefined()
+    expect(configs).toHaveLength(1)
+    const d1 = configs[0].d1_databases as Array<Record<string, string>>
+    expect(d1[0].database_id).toBe('ffb0c2f6-1e2a-4c1e-9a4a-6f0a2c8d1111')
+    // Everything else about the package's config survives the round-trip.
+    expect(d1[0].database_name).toBe('app')
+    expect(configs[0].name).toBe('my-worker')
+    // The deploy read the generated copy, and it is gone afterwards.
+    const deploy = deployCall(calls)!
+    const cfgPath = deploy.argv[deploy.argv.indexOf('--config') + 1]
+    expect(cfgPath).toBeDefined()
+    expect(fs.existsSync(cfgPath)).toBe(false)
+  })
+
+  test('a literal value needs no import, and a dotted type reaches a nested array', async () => {
+    const { error, configs } = await runApply({
+      wranglerConfig: `{
+  "name": "my-worker",
+  "queues": { "producers": [{ "binding": "JOBS", "queue": "PLACEHOLDER" }] },
+}`,
+      config: {
+        bindings: [
+          {
+            type: 'queues.producers',
+            binding: 'JOBS',
+            field: 'queue',
+            value: 'zbc-jobs-preview-pr-42',
+          },
+        ],
+      },
+    })
+    expect(error).toBeUndefined()
+    const producers = (configs[0].queues as { producers: Array<Record<string, string>> }).producers
+    expect(producers[0].queue).toBe('zbc-jobs-preview-pr-42')
+  })
+
+  test('a binding the package does not declare fails before wrangler runs', async () => {
+    const { error, calls } = await runApply({
+      wranglerConfig: `{ "name": "my-worker", "d1_databases": [{ "binding": "DB" }] }`,
+      config: {
+        bindings: [{ type: 'd1_databases', binding: 'TYPO', field: 'database_id', value: 'db-1' }],
+      },
+    })
+    expect(error).toBeDefined()
+    expect(error!.message).toContain('TYPO')
+    expect(error!.message).toContain('d1_databases')
+    expect(calls).toHaveLength(0)
+  })
+
+  test('an unresolvable reference fails before wrangler runs, naming the instance', async () => {
+    const { error, calls } = await runApply({
+      wranglerConfig: `{ "name": "my-worker", "d1_databases": [{ "binding": "DB" }] }`,
+      config: {
+        bindings: [
+          {
+            type: 'd1_databases',
+            binding: 'DB',
+            field: 'database_id',
+            from: 'ghost',
+            output: 'databaseId',
+          },
+        ],
+      },
+      imports: {},
+    })
+    expect(error).toBeDefined()
+    expect(error!.message).toContain('ghost')
+    expect(error!.message).toContain('d1_databases')
+    expect(calls).toHaveLength(0)
+  })
+
+  test('r2Bindings still patches r2_buckets[].bucket_name — same code path', async () => {
+    const { error, configs } = await runApply({
+      wranglerConfig: `{
+  // comments and trailing commas survive being read, not being written
+  "name": "my-worker",
+  "r2_buckets": [{ "binding": "RAW", "bucket_name": "PLACEHOLDER" },],
+}`,
+      config: { r2Bindings: [{ binding: 'RAW', from: 'inbox-raw', output: 'bucketName' }] },
+      imports: { 'inbox-raw': { bucketName: 'zbc-inbox-raw' } },
+    })
+    expect(error).toBeUndefined()
+    const buckets = configs[0].r2_buckets as Array<Record<string, string>>
+    expect(buckets[0].bucket_name).toBe('zbc-inbox-raw')
+  })
+
+  test('an array that keys on `name` (durable_objects) is matched by name', async () => {
+    const { error, configs } = await runApply({
+      wranglerConfig: `{
+  "name": "my-worker",
+  "durable_objects": { "bindings": [{ "name": "ROOM", "class_name": "Room" }] },
+}`,
+      config: {
+        bindings: [
+          {
+            type: 'durable_objects.bindings',
+            binding: 'ROOM',
+            field: 'script_name',
+            value: 'zbc-rooms',
+          },
+        ],
+      },
+    })
+    expect(error).toBeUndefined()
+    const dos = (configs[0].durable_objects as { bindings: Array<Record<string, string>> }).bindings
+    expect(dos[0].script_name).toBe('zbc-rooms')
+    expect(dos[0].class_name).toBe('Room')
+  })
+
+  /**
+   * Wrangler's binding keys are NOT inheritable: `d1_databases`, `r2_buckets`,
+   * `kv_namespaces`, `queues` and friends declared at the top level are not
+   * merged into `env.<name>`. Patching the top-level entry and deploying with
+   * `--env` would therefore ship a worker with no such binding at all —
+   * wrangler only warns — while this module printed the binding as wired.
+   */
+  test('with wranglerEnv, a binding declared only at the top level is an error', async () => {
+    const { error, calls } = await runApply({
+      wranglerConfig: `{
+  "name": "my-worker",
+  "d1_databases": [{ "binding": "DB", "database_id": "PLACEHOLDER" }],
+  "env": { "preview": {} },
+}`,
+      config: {
+        wranglerEnv: 'preview',
+        bindings: [
+          { type: 'd1_databases', binding: 'DB', field: 'database_id', value: 'preview-db-id' },
+        ],
+      },
+    })
+    expect(error).toBeDefined()
+    expect(error!.message).toContain('DB')
+    expect(error!.message).toContain('d1_databases')
+    expect(error!.message).toContain('preview')
+    expect(calls).toHaveLength(0)
+  })
+
+  test('an unmatched r2Bindings entry names r2Bindings, not the key it came from', async () => {
+    const { error, calls } = await runApply({
+      wranglerConfig: `{ "name": "my-worker", "r2_buckets": [{ "binding": "RAW_BUCKET" }] }`,
+      config: { r2Bindings: [{ binding: 'RAW', bucketName: 'zbc-inbox-raw' }] },
+    })
+    expect(error).toBeDefined()
+    expect(error!.message).toContain('r2Bindings')
+    expect(error!.message).toContain('RAW')
+    expect(calls).toHaveLength(0)
+  })
+
+  test('with wranglerEnv, a binding declared only in that env block is patched', async () => {
+    const { error, configs } = await runApply({
+      wranglerConfig: `{
+  "name": "my-worker",
+  "env": { "preview": { "d1_databases": [{ "binding": "DB", "database_id": "PLACEHOLDER" }] } },
+}`,
+      config: {
+        wranglerEnv: 'preview',
+        bindings: [
+          { type: 'd1_databases', binding: 'DB', field: 'database_id', value: 'preview-db-id' },
+        ],
+      },
+    })
+    expect(error).toBeUndefined()
+    const env = configs[0].env as { preview: { d1_databases: Array<Record<string, string>> } }
+    expect(env.preview.d1_databases[0].database_id).toBe('preview-db-id')
   })
 })

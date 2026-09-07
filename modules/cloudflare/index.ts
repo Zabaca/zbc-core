@@ -175,13 +175,78 @@ function resolveWorkerValue(
 }
 
 /**
- * An R2 binding override: which bucket the named `r2_buckets` binding in the
- * package's wrangler config should attach to. Either a literal bucket name or
- * a `{ from, output }` reference into an imported instance's outputs (the r2
- * module emits `bucketName`). Wrangler has no CLI flag for this, so the module
- * patches a generated copy of the wrangler config and deploys with --config —
- * which is what lets a scaffolded package's wrangler.jsonc stay generic while
- * the per-project bucket name lives in the instance file.
+ * A binding override: which resource the named binding in the package's
+ * wrangler config attaches to.
+ *
+ * `workerSecrets`/`workerVars` carry an imported output into the worker's ENV.
+ * Neither can reach a BINDING, because a binding is a field inside the wrangler
+ * config file and wrangler has no CLI flag for it — which is why four consumers
+ * wrote a `d1` module and every one of them still hardcoded `database_id` in
+ * `wrangler.jsonc`. So the module patches a generated copy of that file and
+ * deploys with `--config`.
+ *
+ * The entry is generic on purpose: `type` is the wrangler config key holding
+ * the binding array (`d1_databases`, `kv_namespaces`, `vectorize`, and dotted
+ * for nested ones like `queues.producers`), and `field` is the key on the
+ * matched entry to set (`database_id`, `id`, `bucket_name`, …). A new
+ * Cloudflare resource type therefore needs no new key on this module — the
+ * alternative was `cloudflare` absorbing one config key per resource type, and
+ * per-type keys are how it started absorbing whole modules.
+ *
+ * Wrangler stays the source of truth for TOPOLOGY: the binding must already be
+ * DECLARED in the package's own config (with any placeholder id), and this only
+ * fills in the identifier the provisioning module just produced. A binding no
+ * declaration matches is a hard error before wrangler runs.
+ */
+const bindingSchema = z.union([
+  z.object({
+    /** Wrangler config key holding the binding array, dotted for nested ones. */
+    type: z.string(),
+    /** The entry's `binding` (or, for arrays that use it, `name`) value. */
+    binding: z.string(),
+    /** Which key on that entry to set. */
+    field: z.string(),
+    /** Literal value, straight from this instance's config file. */
+    value: z.string(),
+  }),
+  z.object({
+    type: z.string(),
+    binding: z.string(),
+    field: z.string(),
+    /** Instance name — must be listed in this instance's `imports`. */
+    from: z.string(),
+    /** Which output of that instance holds the value. */
+    output: z.string(),
+  }),
+])
+
+type BindingEntry = z.infer<typeof bindingSchema>
+
+interface ResolvedBinding {
+  type: string
+  binding: string
+  field: string
+  value: string
+  /** Which config key this came from — `bindings` or `r2Bindings` — so an
+   * error points the operator at a key their instance file actually has. */
+  label: string
+}
+
+function resolveBinding(entry: BindingEntry, ctx: ApplyContext): ResolvedBinding {
+  const { type, binding, field } = entry
+  const common = { type, binding, field, label: 'bindings' }
+  if ('value' in entry) return { ...common, value: entry.value }
+  return {
+    ...common,
+    value: ctx.output(entry, `bindings entry "${type}.${binding}.${field}"`),
+  }
+}
+
+/**
+ * The R2 shorthand for the above: `{ binding, bucketName }` or `{ binding,
+ * from, output }`, desugared to `{ type: 'r2_buckets', field: 'bucket_name' }`.
+ * It predates the general form and stays because instance files use it; it is
+ * the only per-resource-type key, and no second one is coming.
  */
 const r2BindingSchema = z.union([
   z.object({
@@ -201,15 +266,15 @@ const r2BindingSchema = z.union([
 
 type R2BindingEntry = z.infer<typeof r2BindingSchema>
 
-function resolveR2Binding(
-  entry: R2BindingEntry,
-  ctx: ApplyContext,
-): { binding: string; bucketName: string } {
-  if ('bucketName' in entry) return { binding: entry.binding, bucketName: entry.bucketName }
-  return {
+function resolveR2Binding(entry: R2BindingEntry, ctx: ApplyContext): ResolvedBinding {
+  const common = {
+    type: 'r2_buckets',
     binding: entry.binding,
-    bucketName: ctx.output(entry, `r2Bindings entry "${entry.binding}"`),
+    field: 'bucket_name',
+    label: 'r2Bindings',
   }
+  if ('bucketName' in entry) return { ...common, value: entry.bucketName }
+  return { ...common, value: ctx.output(entry, `r2Bindings entry "${entry.binding}"`) }
 }
 
 /** Strip line and block comments from JSONC, string-aware. */
@@ -283,44 +348,60 @@ function stripTrailingCommas(src: string): string {
   return out
 }
 
-interface WranglerR2Entry {
-  binding: string
-  bucket_name?: string
+type BindingArrayEntry = Record<string, unknown>
+
+/** Read a dotted path (`queues.producers`) out of one wrangler config block. */
+function bindingArrayAt(
+  block: Record<string, unknown>,
+  type: string,
+): BindingArrayEntry[] | undefined {
+  let node: unknown = block
+  for (const segment of type.split('.')) {
+    if (typeof node !== 'object' || node === null) return undefined
+    node = (node as Record<string, unknown>)[segment]
+  }
+  return Array.isArray(node) ? (node as BindingArrayEntry[]) : undefined
 }
 
 /**
- * Rewrite `bucket_name` for each resolved r2Bindings entry, in the top-level
- * `r2_buckets` and (when `wranglerEnv` is set) the matching `env.<name>` block.
- * A binding with no matching r2_buckets entry is a hard config error.
+ * Set each resolved binding's field on the declaration the deploy will
+ * actually use.
+ *
+ * Which block that is turns on `wranglerEnv`, and it is not "both": wrangler's
+ * binding keys (`d1_databases`, `r2_buckets`, `kv_namespaces`, `queues`,
+ * `durable_objects`, …) are NOT inheritable, so a `--env preview` deploy reads
+ * `env.preview`'s arrays and ignores the top-level ones entirely. Patching a
+ * top-level declaration and reporting the binding as wired would ship a worker
+ * with no such binding at all — wrangler only warns — which is the failure this
+ * whole config key exists to prevent. So with `wranglerEnv` set, only that
+ * env block is searched.
+ *
+ * Wrangler's binding arrays key on `binding`; `durable_objects.bindings` and
+ * friends key on `name`, so an entry with no `binding` key is matched by
+ * `name` instead. A binding no declaration matches is a hard config error.
  */
-function patchR2Buckets(
+function patchBindings(
   config: Record<string, unknown>,
-  resolved: Array<{ binding: string; bucketName: string }>,
+  resolved: ResolvedBinding[],
   wranglerEnv?: string,
 ): void {
-  const blocks: Array<Record<string, unknown>> = [config]
-  if (wranglerEnv) {
-    const envBlock = (config.env as Record<string, Record<string, unknown>> | undefined)?.[
-      wranglerEnv
-    ]
-    if (envBlock) blocks.push(envBlock)
-  }
-  for (const { binding, bucketName } of resolved) {
-    let found = false
-    for (const block of blocks) {
-      const entry = (block.r2_buckets as WranglerR2Entry[] | undefined)?.find(
-        (b) => b.binding === binding,
-      )
-      if (entry) {
-        entry.bucket_name = bucketName
-        found = true
-      }
+  const envBlock = wranglerEnv
+    ? (config.env as Record<string, Record<string, unknown>> | undefined)?.[wranglerEnv]
+    : undefined
+  const block = wranglerEnv ? envBlock : config
+  const where = wranglerEnv
+    ? `the "env.${wranglerEnv}" block of the package's wrangler config (binding keys are not inherited from the top level)`
+    : `the package's wrangler config`
+  for (const { type, binding, field, value, label } of resolved) {
+    const entry = block
+      ? bindingArrayAt(block, type)?.find(
+          (e) => e.binding === binding || (e.binding === undefined && e.name === binding),
+        )
+      : undefined
+    if (!entry) {
+      throw new Error(`${label} entry "${binding}" has no matching ${type} binding in ${where}`)
     }
-    if (!found) {
-      throw new Error(
-        `r2Bindings entry "${binding}" has no matching r2_buckets binding in the package's wrangler config`,
-      )
-    }
+    entry[field] = value
   }
 }
 
@@ -372,8 +453,27 @@ export const cloudflareModule = defineModule({
      * output }` references into an imported instance's outputs (the r2 module
      * emits `bucketName`). Lets the package's wrangler config stay generic —
      * the per-project bucket lives here, next to the other identifiers.
+     *
+     * Shorthand for `bindings` below, which does the same for any binding
+     * type; both go through one resolver, and a new resource type wants
+     * `bindings`, not a second key like this one.
      */
     r2Bindings: z.array(r2BindingSchema).default([]),
+    /**
+     * Fill in a binding's identifier in the package's wrangler config from an
+     * imported instance's outputs (or a literal), for ANY binding type:
+     * `{ type: 'd1_databases', binding: 'DB', field: 'database_id', from:
+     * 'app-db', output: 'databaseId' }`. `type` is the wrangler config key
+     * holding the binding array (dotted for nested ones — `queues.producers`),
+     * `field` the key on the matched entry to set.
+     *
+     * This is what `workerSecrets`/`workerVars` cannot do: those reach the
+     * worker's ENV, and a binding lives in the config file wrangler reads. The
+     * binding must already be DECLARED there (placeholder id and all) — only
+     * the identifier comes from here, so wrangler keeps owning topology and a
+     * typo'd binding is a hard error rather than a silently-added binding.
+     */
+    bindings: z.array(bindingSchema).default([]),
     /**
      * For container-backed Workers: roll the running container to the new image
      * IMMEDIATELY on deploy (`--containers-rollout immediate`). The wrangler
@@ -475,27 +575,30 @@ export const cloudflareModule = defineModule({
     const resolvedSecrets = config.workerSecrets.map((entry) =>
       resolveWorkerValue(entry, ctx, 'workerSecrets'),
     )
-    const resolvedR2 = config.r2Bindings.map((entry) => resolveR2Binding(entry, ctx))
+    const resolvedBindings = [
+      ...config.r2Bindings.map((entry) => resolveR2Binding(entry, ctx)),
+      ...config.bindings.map((entry) => resolveBinding(entry, ctx)),
+    ]
 
-    // 2b. r2Bindings: wrangler has no CLI flag for bucket overrides, so patch
+    // 2b. bindings: wrangler has no CLI flag for binding identifiers, so patch
     //     a generated copy of the package's wrangler config and deploy with
     //     --config. Written next to the original so relative paths (main,
     //     assets dir) still resolve; comments don't survive the round-trip,
     //     but the file is throwaway (deleted after deploy).
     let generatedConfig: string | undefined
-    if (resolvedR2.length > 0) {
+    if (resolvedBindings.length > 0) {
       const configPath = ['wrangler.jsonc', 'wrangler.json']
         .map((f) => path.join(workdir, f))
         .find((f) => fs.existsSync(f))
       if (!configPath) {
         throw new Error(
-          `r2Bindings requires a wrangler.jsonc/wrangler.json in ${config.workdir} (wrangler.toml is not supported)`,
+          `bindings require a wrangler.jsonc/wrangler.json in ${config.workdir} (wrangler.toml is not supported)`,
         )
       }
       const parsed = JSON.parse(
         stripTrailingCommas(stripJsoncComments(fs.readFileSync(configPath, 'utf8'))),
       ) as Record<string, unknown>
-      patchR2Buckets(parsed, resolvedR2, config.wranglerEnv)
+      patchBindings(parsed, resolvedBindings, config.wranglerEnv)
       generatedConfig = path.join(workdir, 'wrangler.zbc-generated.json')
       fs.writeFileSync(generatedConfig, JSON.stringify(parsed, null, 2))
     }
@@ -512,7 +615,7 @@ export const cloudflareModule = defineModule({
     for (const route of config.routes) deployArgs.push('--route', route)
     for (const { name, value } of resolvedVars) deployArgs.push('--var', `${name}:${value}`)
     console.log(
-      `  Deploying via wrangler (in ${config.workdir})${config.wranglerEnv ? ` [env: ${config.wranglerEnv}]` : ''}${config.workerName ? ` [name: ${config.workerName}]` : ''}${config.immediateContainerRollout ? ' [immediate container rollout]' : ''}${config.routes.length ? ` [routes: ${config.routes.join(', ')}]` : ''}${resolvedVars.length ? ` [vars: ${resolvedVars.map((v) => v.name).join(', ')}]` : ''}${resolvedR2.length ? ` [r2: ${resolvedR2.map((b) => `${b.binding}→${b.bucketName}`).join(', ')}]` : ''}`,
+      `  Deploying via wrangler (in ${config.workdir})${config.wranglerEnv ? ` [env: ${config.wranglerEnv}]` : ''}${config.workerName ? ` [name: ${config.workerName}]` : ''}${config.immediateContainerRollout ? ' [immediate container rollout]' : ''}${config.routes.length ? ` [routes: ${config.routes.join(', ')}]` : ''}${resolvedVars.length ? ` [vars: ${resolvedVars.map((v) => v.name).join(', ')}]` : ''}${resolvedBindings.length ? ` [bindings: ${resolvedBindings.map((b) => `${b.type}.${b.binding}.${b.field}→${b.value}`).join(', ')}]` : ''}`,
     )
     let out: string
     try {
