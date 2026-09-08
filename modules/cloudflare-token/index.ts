@@ -223,6 +223,21 @@ export const cloudflareTokenModule = defineModule({
     s3AccessKeyId: z.string(),
     s3SecretAccessKey: z.string(),
   }),
+  /**
+   * The two outputs that are credentials. `rotates: 'each-apply'` is this
+   * module's whole discipline stated where the engine can act on it: the value
+   * is rolled every apply, so it must reach its dependents in memory and land
+   * nowhere else — not in an error the engine prints, not in `zbc apply
+   * --json`.
+   *
+   * `tokenId` and `s3AccessKeyId` are deliberately absent: an id names the
+   * credential, it is not the credential, and redacting it would cost the
+   * operator the one field that lets them find the token in the dashboard.
+   */
+  secretOutputs: {
+    tokenValue: { rotates: 'each-apply' },
+    s3SecretAccessKey: { rotates: 'each-apply' },
+  },
   async apply(config, ctx) {
     const rootToken = ctx.secret(config.rootTokenSecret)
 

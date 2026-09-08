@@ -153,6 +153,41 @@ export interface BoundReadiness<TConfig, TOutputs> extends Omit<
   probe(outputs: TOutputs, config: TConfig, ctx: ApplyContextInput): Promise<boolean | void>
 }
 
+/**
+ * When a credential is replaced, and therefore who is allowed to hold it.
+ *
+ * The axis the consumer survey actually found is not ephemeral-vs-long-lived —
+ * it is WHO CONSUMES the credential:
+ *
+ * - `'each-apply'` — the apply itself consumes it. `cloudflare-token` rolls its
+ *   value on every apply and hands it to dependents in the same run; ceo's
+ *   `gcp` mints a fresh service-account key each time. Rotation is free because
+ *   nobody outside the run is holding the old one.
+ * - `'never'` — someone OUTSIDE the apply holds it, on their own cadence.
+ *   leeandco's `cloudflare-access-service-token` creates once, prints once and
+ *   deliberately keeps the value out of `outputs`, because its consumer is an
+ *   agent that would be silently broken by a roll. An instance of such a module
+ *   may not be `ephemeral`: destroy-then-recreate IS a rotation.
+ */
+export type SecretRotation = 'each-apply' | 'never'
+
+export interface SecretOutputDeclaration {
+  rotates: SecretRotation
+}
+
+/**
+ * The outputs of a module that are CREDENTIALS, by output key.
+ *
+ * Declaring one changes nothing about how it flows: `ctx.output` hands the
+ * importing module the same string it always did, in memory. What it changes is
+ * everywhere else — the engine redacts the value from the text it prints, and
+ * writes `[redacted]` in its place in `zbc apply --json`. See
+ * `src/engine/secret-outputs.ts` for the two leaks that motivated each.
+ */
+export type SecretOutputs<TOutputs> = Partial<
+  Record<Extract<keyof TOutputs, string>, SecretOutputDeclaration>
+>
+
 export interface ModuleDefinition<TConfig extends z.ZodType, TOutputs extends z.ZodType> {
   name: string
   configSchema: TConfig
@@ -163,6 +198,8 @@ export interface ModuleDefinition<TConfig extends z.ZodType, TOutputs extends z.
    * between "created" and "usable" — which is most of them, and they pay
    * nothing for this. */
   ready?: BoundReadiness<z.infer<TConfig>, z.infer<TOutputs>>
+  /** See `SecretOutputs`. Absent on every module that emits no credential. */
+  secretOutputs?: SecretOutputs<z.infer<TOutputs>>
   instance: (opts: InstanceOptions<TConfig>) => ModuleInstance<TOutputs>
 }
 

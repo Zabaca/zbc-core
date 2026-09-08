@@ -7,6 +7,7 @@ import type {
   ModuleDefinition,
   ModuleInstance,
   ReadinessDeclaration,
+  SecretOutputs,
 } from './types'
 
 interface DefineModuleOptions<TConfig extends z.ZodType, TOutputs extends z.ZodType> {
@@ -17,6 +18,8 @@ interface DefineModuleOptions<TConfig extends z.ZodType, TOutputs extends z.ZodT
   destroy?: DestroyFn<z.infer<TConfig>>
   /** What proves the applied resource is usable — see `ReadinessDeclaration`. */
   ready?: ReadinessDeclaration<z.infer<TConfig>, z.infer<TOutputs>>
+  /** Which outputs are credentials, and on what cadence — see `SecretOutputs`. */
+  secretOutputs?: SecretOutputs<z.infer<TOutputs>>
 }
 
 /**
@@ -72,6 +75,10 @@ export function defineModule<TConfig extends z.ZodType, TOutputs extends z.ZodTy
       ...opts.ready,
       probe: (outputs, config, ctx) => opts.ready!.probe(outputs, config, ensureApplyContext(ctx)),
     },
+    // A declaration, not behaviour: the engine reads it, the module body never
+    // does. Carried verbatim so `undefined` stays absent rather than becoming a
+    // present-but-empty key the engine would have to special-case.
+    ...(opts.secretOutputs ? { secretOutputs: opts.secretOutputs } : {}),
     instance(instanceOpts: InstanceOptions<TConfig>): ModuleInstance<TOutputs> {
       return {
         name: instanceOpts.name,
