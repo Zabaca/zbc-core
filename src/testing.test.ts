@@ -20,7 +20,46 @@ const probe = defineModule({
   },
 })
 
+/**
+ * A module reading a NON-string output. varnick's `client-account` emits
+ * `nameServers: string[]` for its sibling to consume, and until `outputValue`
+ * that value could not cross an imports edge at all.
+ */
+const delegator = defineModule({
+  name: 'delegator',
+  configSchema: z.object({}),
+  outputs: z.object({ first: z.string(), count: z.number() }),
+  async apply(_config, ctx) {
+    const servers = ctx.outputValue(
+      { from: 'acct', output: 'nameServers' },
+      'nameServers',
+    ) as string[]
+    return { first: servers[0]!, count: servers.length }
+  },
+})
+
 describe('createTestContext', () => {
+  test('a non-string output crosses the edge through outputValue, and is recorded', async () => {
+    const ctx = createTestContext({
+      imports: { acct: { nameServers: ['ada.ns.cloudflare.com', 'bob.ns.cloudflare.com'] } },
+    })
+
+    expect(await delegator.apply({}, ctx)).toEqual({ first: 'ada.ns.cloudflare.com', count: 2 })
+    expect(ctx.outputsRead).toEqual(['acct.nameServers'])
+  })
+
+  test('ctx.output on that same output refuses, and says to use outputValue', async () => {
+    const ctx = createTestContext({
+      imports: { acct: { nameServers: ['ada.ns.cloudflare.com'] } },
+    })
+
+    expect(() =>
+      ctx.output({ from: 'acct', output: 'nameServers' }, 'workerVars entry "NS"'),
+    ).toThrow(
+      'workerVars entry "NS" references output "nameServers" on instance "acct", which emits an array, not a string — read it with ctx.outputValue instead',
+    )
+  })
+
   test('an apply can be run against stubbed secrets and imports alone', async () => {
     const ctx = createTestContext({
       secrets: { API_TOKEN: 'tok-1' },

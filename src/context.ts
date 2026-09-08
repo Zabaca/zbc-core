@@ -66,6 +66,45 @@ export function resolveOutput(
   field: string,
   opts: OutputOptions = {},
 ): string {
+  const value = resolveOutputValue(ref, imports, field)
+  if (typeof value !== 'string') {
+    // Not "doesn't emit it": it does, and that message sent the reader to the
+    // emitting module to add an output that is already there. The fix is at
+    // this end — the string rule is `output`'s, not the edge's.
+    throw new Error(
+      `${field} references output "${ref.output}" on instance "${ref.from}", which emits ` +
+        `${describeType(value)}, not a string — read it with ctx.outputValue instead`,
+    )
+  }
+  if (value === '' && !opts.allowBlank) {
+    throw new Error(
+      `${field} references output "${ref.output}" on instance "${ref.from}", which doesn't emit it`,
+    )
+  }
+  return value
+}
+
+/**
+ * `ctx.outputValue`: the same edge, without the string rule.
+ *
+ * Outputs were strings because every consumer of one — a worker secret, a
+ * wrangler binding field, a `--var` — is a string. But an output is whatever
+ * the emitting module's `outputsSchema` says it is, and varnick's
+ * `client-account` emits `nameServers: string[]` annotated "Ticket 05 consumes
+ * this": a value that could not cross an imports edge at all, so the consuming
+ * instance re-derived it from the provider.
+ *
+ * Absent is still absent — `undefined` and `null` are the same "doesn't emit
+ * it" failure `output` reports, with the same three messages. What is gone is
+ * only the type check and the blank rule: `0`, `false` and `''` are values a
+ * module asked for, and there is no `allowBlank` here because there is nothing
+ * for it to mean.
+ */
+export function resolveOutputValue(
+  ref: OutputRef,
+  imports: Record<string, unknown>,
+  field: string,
+): unknown {
   if (!ref.from || !ref.output) {
     throw new Error(`${field} must name both an instance (\`from\`) and an output (\`output\`)`)
   }
@@ -76,12 +115,18 @@ export function resolveOutput(
     )
   }
   const value = (outputs as Record<string, unknown> | null)?.[ref.output]
-  if (typeof value !== 'string' || (value === '' && !opts.allowBlank)) {
+  if (value === undefined || value === null) {
     throw new Error(
       `${field} references output "${ref.output}" on instance "${ref.from}", which doesn't emit it`,
     )
   }
   return value
+}
+
+/** "a number", "an array" — what the reader has to look at to fix the ref. */
+function describeType(value: unknown): string {
+  if (Array.isArray(value)) return 'an array'
+  return typeof value === 'object' ? 'an object' : `a ${typeof value}`
 }
 
 /** The context the engine hands a module: the three fields plus the two rules. */
@@ -96,6 +141,9 @@ export function createApplyContext(input: ApplyContextInput): ApplyContext {
     output(ref, field, opts) {
       return resolveOutput(ref, input.imports, field, opts)
     },
+    outputValue(ref, field) {
+      return resolveOutputValue(ref, input.imports, field)
+    },
   }
 }
 
@@ -109,7 +157,19 @@ export function createApplyContext(input: ApplyContextInput): ApplyContext {
  */
 export function ensureApplyContext(ctx: ApplyContextInput | ApplyContext): ApplyContext {
   const candidate = ctx as ApplyContext
-  return typeof candidate.secret === 'function' && typeof candidate.output === 'function'
-    ? candidate
-    : createApplyContext(ctx)
+  if (typeof candidate.secret !== 'function' || typeof candidate.output !== 'function') {
+    return createApplyContext(ctx)
+  }
+  // A full context from before `outputValue` existed — a consumer's own harness,
+  // or an engine one step behind this file. It is still a real context with its
+  // own `output`, so the missing method is ADDED rather than the whole thing
+  // rebuilt: rebuilding would discard a lazy `output` and silently reinstate the
+  // `imports: {}` behaviour that on-demand resolution replaced.
+  if (typeof candidate.outputValue !== 'function') {
+    return {
+      ...candidate,
+      outputValue: (ref, field) => resolveOutputValue(ref, candidate.imports, field),
+    }
+  }
+  return candidate
 }

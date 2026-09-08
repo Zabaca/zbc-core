@@ -26,7 +26,10 @@ export interface TestContextOptions {
 export interface TestApplyContext extends ApplyContext {
   /** Secret keys the module asked for, in the order it asked. */
   readonly secretsRead: string[]
-  /** Output refs the module resolved, as `<instance>.<output>`, in order. */
+  /**
+   * Output refs the module resolved, as `<instance>.<output>`, in order —
+   * through either `output` or `outputValue`.
+   */
   readonly outputsRead: string[]
 }
 
@@ -71,6 +74,13 @@ export function createTestContext(opts: TestContextOptions = {}): TestApplyConte
     output(ref: OutputRef, field: string, outputOpts?: OutputOptions): string {
       outputsRead.push(`${ref.from ?? '?'}.${ref.output ?? '?'}`)
       return base.output(ref, field, outputOpts)
+    },
+    // Both spellings of the same edge land in one list: a test asserting "this
+    // module reads its sibling's output" should not have to know which of the
+    // two the module happened to call.
+    outputValue(ref: OutputRef, field: string): unknown {
+      outputsRead.push(`${ref.from ?? '?'}.${ref.output ?? '?'}`)
+      return base.outputValue(ref, field)
     },
   }
 }

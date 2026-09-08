@@ -4,6 +4,43 @@ export type ApplyFn<TConfig, TOutputs> = (config: TConfig, ctx: ApplyContext) =>
 
 export type DestroyFn<TConfig> = (config: TConfig, ctx: ApplyContext) => Promise<void>
 
+/** An action's body. Same context as `apply`; no outputs — see `ActionDeclaration`. */
+export type ActionFn<TConfig> = (config: TConfig, ctx: ApplyContext) => Promise<void>
+
+/**
+ * The third verb: something an OPERATOR does to an instance, once, on purpose.
+ *
+ * `apply` converges and must be safe to re-run; `destroy` tears the instance
+ * down. Buying a domain is neither. varnick's `client-domain` proves what the
+ * absence costs: its `apply` does one GET, hard-halts and prints a command,
+ * while the purchase — least-privilege ephemeral registrar token, a 15-minute
+ * `expires_on` dead-man switch, a `finally` delete that shouts a curl command
+ * if the delete fails — lives in a `purchase.ts` that `index.ts` imports from
+ * nowhere, behind a closure test asserting the import does not exist. All of
+ * that care is invisible to zbc, and the graph, the secrets and the imports are
+ * not there either.
+ *
+ * An action is never run by `zbc apply` or `zbc destroy`, only by
+ * `zbc run <env> <instance> <action>`. Read its imports through `ctx.output` /
+ * `ctx.outputValue` — never `ctx.imports`, which outside an apply pass holds
+ * only what is applied already. A non-`irreversible` action's body may be
+ * RE-ENTERED once per import it turns out to need, so resolve everything you
+ * read before the first side effect; an `irreversible` one is never re-entered,
+ * because the engine applies its imports before it starts. It returns nothing: an instance's
+ * outputs are its `apply`'s, and an action that wanted to change them would be
+ * converging — which is `apply`'s job.
+ */
+export interface ActionDeclaration<TConfig> {
+  /** One line, shown by `zbc run <env> <instance>` and `zbc list`. */
+  description: string
+  /**
+   * This action cannot be undone by running something else — it spends money,
+   * registers a name, sends mail. `zbc run` refuses it without `--yes`.
+   */
+  irreversible?: boolean
+  run: ActionFn<TConfig>
+}
+
 /**
  * The proof that a just-created resource is USABLE, not merely created.
  *
@@ -113,6 +150,18 @@ export interface ApplyContext extends ApplyContextInput {
    * string — "nothing to do" is a real answer for some outputs.
    */
   output(ref: OutputRef, field: string, opts?: OutputOptions): string
+  /**
+   * The same import, without the string rule — for an output whose shape is
+   * the point (`nameServers: string[]`). Absence fails identically; `0`,
+   * `false` and `''` are values, so there is no `allowBlank`.
+   *
+   * Typed `unknown` rather than generic: the engine validated the emitting
+   * module's `outputsSchema` before this value crossed, but nothing here knows
+   * WHICH module the ref names, so a caller-supplied type parameter would be
+   * an unchecked assertion wearing a check's clothes. Narrow it where you read
+   * it.
+   */
+  outputValue(ref: OutputRef, field: string): unknown
 }
 
 /**
@@ -151,6 +200,11 @@ export interface BoundReadiness<TConfig, TOutputs> extends Omit<
   'probe'
 > {
   probe(outputs: TOutputs, config: TConfig, ctx: ApplyContextInput): Promise<boolean | void>
+}
+
+/** A published action, with `run` bound the way `apply` and `destroy` are. */
+export interface BoundAction<TConfig> extends Omit<ActionDeclaration<TConfig>, 'run'> {
+  run(config: TConfig, ctx: ApplyContextInput): Promise<void>
 }
 
 /**
@@ -198,6 +252,9 @@ export interface ModuleDefinition<TConfig extends z.ZodType, TOutputs extends z.
    * between "created" and "usable" — which is most of them, and they pay
    * nothing for this. */
   ready?: BoundReadiness<z.infer<TConfig>, z.infer<TOutputs>>
+  /** Operator-invoked verbs, by name — see `ActionDeclaration`. Absent on
+   * almost every module, and a module that declares none pays nothing. */
+  actions?: Record<string, BoundAction<z.infer<TConfig>>>
   /** See `SecretOutputs`. Absent on every module that emits no credential. */
   secretOutputs?: SecretOutputs<z.infer<TOutputs>>
   instance: (opts: InstanceOptions<TConfig>) => ModuleInstance<TOutputs>
