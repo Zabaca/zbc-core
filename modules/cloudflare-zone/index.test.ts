@@ -33,11 +33,19 @@ interface CfRecord {
   priority?: number
 }
 
+interface CfSetting {
+  id: string
+  value: string
+  editable?: boolean
+}
+
 interface StubState {
   /** zone name → the zone as the API would report it. */
   zones?: Record<string, { id: string; accountId: string; nameServers?: string[] }>
   /** zone id → its records. Mutated in place by POST/PATCH/DELETE. */
   records?: Record<string, CfRecord[]>
+  /** zone id → its settings, as `GET /zones/:id/settings` reports them. */
+  settings?: Record<string, CfSetting[]>
   /** First-match override: return a CF envelope to short-circuit a route. */
   override?: (method: string, url: string) => unknown | undefined
 }
@@ -148,6 +156,26 @@ function installFetchStub(state: StubState): { calls: RecordedCall[]; state: Stu
         list.splice(index, 1)
         return respond(envelope({ id: recordId }))
       }
+    }
+
+    const settingsMatch = /^\/client\/v4\/zones\/([^/]+)\/settings$/.exec(path)
+    if (settingsMatch && method === 'GET') {
+      return respond(envelope(state.settings?.[settingsMatch[1]!] ?? []))
+    }
+
+    const oneSettingMatch = /^\/client\/v4\/zones\/([^/]+)\/settings\/([^/]+)$/.exec(path)
+    if (oneSettingMatch && method === 'PATCH') {
+      const [, zoneId, settingId] = oneSettingMatch as unknown as [string, string, string]
+      const setting = (state.settings?.[zoneId] ?? []).find((s) => s.id === settingId)
+      if (!setting) {
+        return respond({
+          success: false,
+          errors: [{ message: `setting ${settingId} not found` }],
+          result: null,
+        })
+      }
+      setting.value = String((call.body as Record<string, unknown>).value)
+      return respond(envelope(setting))
     }
 
     return respond({
@@ -676,5 +704,119 @@ describe('cloudflare-zone apply — hard errors are fail-fast', () => {
     })
     expect(error).toBeDefined()
     expect(error!.message).toContain('record already exists')
+  })
+})
+
+describe('cloudflare-zone apply — zone settings', () => {
+  const insecure = (): StubState => ({
+    zones: ZONES,
+    records: { 'zone-1': [] },
+    settings: {
+      'zone-1': [
+        { id: 'always_use_https', value: 'off', editable: true },
+        { id: 'ssl', value: 'full', editable: true },
+      ],
+    },
+  })
+
+  test('a declared setting whose live value differs is patched, and nothing else is', async () => {
+    const { error, calls } = await runApply({
+      config: { settings: { always_use_https: 'on' } },
+      state: insecure(),
+    })
+    expect(error).toBeUndefined()
+
+    const patches = byMethod(calls, 'PATCH')
+    expect(patches).toHaveLength(1)
+    expect(patches[0]!.url).toBe(
+      'https://api.cloudflare.com/client/v4/zones/zone-1/settings/always_use_https',
+    )
+    expect(patches[0]!.body).toEqual({ value: 'on' })
+    expect(byMethod(calls, 'POST')).toHaveLength(0)
+    expect(byMethod(calls, 'DELETE')).toHaveLength(0)
+  })
+
+  test('a second apply over the settled zone mutates nothing', async () => {
+    const stub = installFetchStub(insecure())
+    const first = await runApply({ config: { settings: { always_use_https: 'on' } }, stub })
+    expect(first.error).toBeUndefined()
+    const second = await runApply({ config: { settings: { always_use_https: 'on' } }, stub })
+    expect(second.error).toBeUndefined()
+    expect(mutations(second.calls)).toHaveLength(0)
+  })
+
+  test('a setting the zone reports as not editable refuses before anything is written', async () => {
+    const state = insecure()
+    state.settings!['zone-1']!.push({ id: 'min_tls_version', value: '1.0', editable: false })
+    const { error, calls } = await runApply({
+      config: {
+        records: [APEX_AAAA],
+        settings: { always_use_https: 'on', min_tls_version: '1.2' },
+      },
+      state,
+    })
+    expect(error?.message).toContain('min_tls_version')
+    expect(error?.message).toContain('editable')
+    // Nothing was written — not the setting that WAS editable, and not the record.
+    expect(mutations(calls)).toHaveLength(0)
+  })
+
+  test('a setting Cloudflare does not report at all refuses rather than guessing', async () => {
+    const state = insecure()
+    state.settings!['zone-1'] = [{ id: 'ssl', value: 'full', editable: true }]
+    const { error, calls } = await runApply({
+      config: { settings: { always_use_https: 'on' } },
+      state,
+    })
+    expect(error?.message).toContain('always_use_https')
+    expect(mutations(calls)).toHaveLength(0)
+  })
+
+  test('a not-editable setting that is ALREADY the declared value converges rather than refusing', async () => {
+    const state = insecure()
+    // Cloudflare reports the effective value of a plan-gated setting alongside
+    // `editable: false`. Nothing needs writing, so nothing should refuse.
+    state.settings!['zone-1']!.push({ id: 'min_tls_version', value: '1.2', editable: false })
+    const { result, error, calls } = await runApply({
+      config: { records: [APEX_AAAA], settings: { min_tls_version: '1.2' } },
+      state,
+    })
+    expect(error).toBeUndefined()
+    expect(byMethod(calls, 'PATCH')).toHaveLength(0)
+    expect(result!.settingsChanged).toEqual([])
+    // The record half of the same instance still applied.
+    expect(byMethod(calls, 'POST')).toHaveLength(1)
+  })
+
+  test('a setting whose declared value is undefined is not a declaration', async () => {
+    // The environment-conditional style this repo already uses:
+    // `always_use_https: process.env.X ? 'on' : undefined`.
+    const { result, error, calls } = await runApply({
+      config: { settings: { always_use_https: undefined } },
+      state: insecure(),
+    })
+    expect(error).toBeUndefined()
+    expect(mutations(calls)).toHaveLength(0)
+    expect(calls.filter((c) => c.url.includes('/settings'))).toHaveLength(0)
+    expect(result!.settingsChanged).toEqual([])
+  })
+
+  test('an instance declaring no settings never asks the settings API anything', async () => {
+    const { error, calls } = await runApply({
+      config: { records: [APEX_AAAA] },
+      state: insecure(),
+    })
+    expect(error).toBeUndefined()
+    expect(calls.filter((c) => c.url.includes('/settings'))).toHaveLength(0)
+  })
+
+  test('outputs name the settings that changed, and leave the rest out', async () => {
+    const { result, error } = await runApply({
+      config: { settings: { always_use_https: 'on', ssl: 'full' } },
+      state: insecure(),
+    })
+    expect(error).toBeUndefined()
+    expect(result!.settingsChanged).toEqual(['always_use_https: off => on'])
+    expect(result!.changed).toBe(true)
   })
 })

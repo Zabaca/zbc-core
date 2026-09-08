@@ -53,6 +53,25 @@ import { cf, cfRaw } from '../cloudflare-api'
 // so. Other record types reject the flag outright (the schemas are `.strict()`)
 // so `proxied: false` on a TXT can never read as a considered choice.
 //
+// ── ZONE SETTINGS ARE FORWARD-ONLY, AND THAT IS NOT THE RECORD RULE ───────
+// `settings` converges zone-level settings — `always_use_https` and its
+// neighbours. It lives here rather than in the deploying module because it is
+// state about the ZONE, and a Worker that happens to sit on a hostname in it is
+// not the thing that owns it (see ADR-0016).
+//
+// The rule is deliberately NOT the record rule. A zone carries every setting at
+// all times, so "present in Cloudflare, declared nowhere" — the sentence the
+// whole `allowDelete` design exists to answer — cannot be said about a setting.
+// So: what is declared is converged, what is not declared is not read, not
+// reported and not touched. There is nothing to opt into and nothing to delete.
+//
+// What the settings converge CAN do is fail, and it does so before writing
+// anything at all. A setting the zone reports as `editable: false` is gated on
+// the account's plan; one absent from the zone's own list is an id Cloudflare
+// does not offer. Both refuse in the plan, ahead of the first record write —
+// discovering either from a half-applied PATCH would leave the zone in a state
+// neither the file nor the previous apply describes.
+//
 // ── Account-parameterised ─────────────────────────────────────────────────
 // `accountId` is instance config, never a constant: each client's
 // zone in that Client's own Cloudflare account. Apply refuses outright if the
@@ -123,6 +142,35 @@ const recordSchema = z.discriminatedUnion('type', [
 
 export type RecordConfig = z.infer<typeof recordSchema>
 
+/**
+ * The zone settings this module can converge, with the values Cloudflare
+ * accepts for each. A closed list rather than an open `Record<string, string>`:
+ * every one of these is a string enum in the API with its own legal values, and
+ * a typo in either half is rejected at the boundary instead of at the PATCH.
+ *
+ * `.partial()` because a declared setting is the unit — an instance says
+ * `always_use_https: 'on'` and says nothing about TLS, and that silence is
+ * meaningful. `.strict()` so a setting nobody taught this module is a config
+ * error rather than a key silently dropped and never applied.
+ */
+const settingsSchema = z
+  .object({
+    /**
+     * The setting behind the recorded outage: with it off, `http://` is served
+     * as-is, the page is a non-secure context, and the browser APIs gated on
+     * one (Geolocation, among others) are simply absent.
+     */
+    always_use_https: z.enum(['on', 'off']),
+    automatic_https_rewrites: z.enum(['on', 'off']),
+    ssl: z.enum(['off', 'flexible', 'full', 'strict']),
+    min_tls_version: z.enum(['1.0', '1.1', '1.2', '1.3']),
+  })
+  .partial()
+  .strict()
+  .default({})
+
+export type ZoneSettings = z.infer<typeof settingsSchema>
+
 const configSchema = z
   .object({
     /** Cloudflare account id. Instance config, never a constant. */
@@ -144,6 +192,12 @@ const configSchema = z
     }),
     /** The full declared record set for the zone. */
     records: z.array(recordSchema).default([]),
+    /**
+     * Zone-level settings this instance converges. See the header: declared
+     * settings are converged, undeclared ones are not read and not reported,
+     * and nothing here is ever turned back off.
+     */
+    settings: settingsSchema,
     /**
      * Perform the deletions this module prints. Defaults to false: undeclared
      * records are always reported, never removed, until an operator opts in.
@@ -394,6 +448,76 @@ export function planZone(input: { desired: DesiredRecord[]; actual: ActualRecord
   return { create, update, unchanged, undeclared, emailProvisioned }
 }
 
+/** One setting as `GET /zones/:id/settings` reports it. */
+export interface ActualSetting {
+  id: string
+  value: unknown
+  editable?: boolean
+}
+
+export interface SettingsPlan {
+  /** Declared, editable, and not what the zone currently holds. */
+  change: Array<{ id: string; from: string; to: string }>
+  /** Declared and already correct. */
+  unchanged: string[]
+  /** Declared, present, and the zone says it cannot be written. */
+  notEditable: string[]
+  /** Declared and absent from the zone's own list of settings. */
+  missing: string[]
+}
+
+/**
+ * What the next apply does to the zone's settings. Pure; exported for tests.
+ *
+ * The asymmetry with `planZone` is the whole design and is worth stating: a
+ * zone carries EVERY setting at all times, so there is no such thing as a
+ * setting that is "present and undeclared". Drift, `allowDelete` and the
+ * report-then-opt-in dance that records need have no meaning here. What is
+ * declared is converged; what is not declared is not read, not reported, and
+ * not touched.
+ *
+ * `notEditable` and `missing` are separated because they are different
+ * mistakes with different fixes. A setting Cloudflare reports with
+ * `editable: false` is gated on the account's plan. A setting absent from the
+ * list is one Cloudflare does not offer under that id at all, and PATCHing it
+ * would 404 halfway through a converge. Both refuse, and neither is inferred
+ * from a failed write.
+ *
+ * ⚠️ The value is compared BEFORE `editable` is consulted, and the order is
+ * load-bearing. Cloudflare reports the effective value of a plan-gated setting
+ * alongside `editable: false`, so a zone that already holds the declared value
+ * is converged — there is nothing to write, and refusing would make the whole
+ * instance permanently un-appliable (records included) over a no-op. Only a
+ * setting that must actually MOVE and cannot is a refusal.
+ */
+export function planSettings(input: {
+  desired: Record<string, string>
+  actual: readonly ActualSetting[]
+}): SettingsPlan {
+  const plan: SettingsPlan = { change: [], unchanged: [], notEditable: [], missing: [] }
+  for (const [id, want] of Object.entries(input.desired)) {
+    const live = input.actual.find((setting) => setting.id === id)
+    if (!live) {
+      plan.missing.push(id)
+      continue
+    }
+    const have = String(live.value)
+    if (have === want) {
+      plan.unchanged.push(id)
+      continue
+    }
+    if (live.editable === false) {
+      plan.notEditable.push(id)
+      continue
+    }
+    plan.change.push({ id, from: have, to: want })
+  }
+  return plan
+}
+
+export const describeSettingChange = (c: { id: string; from: string; to: string }) =>
+  `${c.id}: ${c.from} => ${c.to}`
+
 // ── Apply ─────────────────────────────────────────────────────────────────
 
 interface CfDnsRecord {
@@ -465,6 +589,8 @@ export const cloudflareZoneModule = defineModule({
     undeclared: z.array(z.string()),
     /** Records left alone because cloudflare-email owns them. */
     emailProvisioned: z.array(z.string()),
+    /** Settings this apply moved, as `id: from => to`. Empty when none did. */
+    settingsChanged: z.array(z.string()),
     changed: z.boolean(),
   }),
   async apply(config, ctx) {
@@ -509,7 +635,48 @@ export const cloudflareZoneModule = defineModule({
       console.log(`    · ${describeRecord(record)} — left alone (cloudflare-email ${purpose})`)
     }
 
-    // 3. Creates and updates always apply.
+    // 3. Plan the settings BEFORE any record is written. A settings refusal
+    //    that arrived after half the records had been created would leave the
+    //    zone in a state neither the file nor the previous apply describes.
+    // `undefined` values are dropped rather than declared. `.partial()` keeps an
+    // explicitly-undefined key in zod's output, and an instance written in the
+    // environment-conditional style this repo uses elsewhere
+    // (`always_use_https: process.env.X ? 'on' : undefined`) would otherwise
+    // reach Cloudflare as a PATCH with an empty body — after the records had
+    // already been written, which is the one thing the plan-first order exists
+    // to prevent.
+    const desiredSettings: Record<string, string> = {}
+    for (const [id, value] of Object.entries(config.settings)) {
+      if (value !== undefined) desiredSettings[id] = value
+    }
+    let settingsPlan: SettingsPlan = { change: [], unchanged: [], notEditable: [], missing: [] }
+    if (Object.keys(desiredSettings).length > 0) {
+      const actualSettings = await cf<ActualSetting[]>(token, 'GET', `/zones/${zone.id}/settings`)
+      settingsPlan = planSettings({ desired: desiredSettings, actual: actualSettings })
+      if (settingsPlan.notEditable.length > 0 || settingsPlan.missing.length > 0) {
+        const parts: string[] = []
+        if (settingsPlan.notEditable.length > 0) {
+          parts.push(
+            `${settingsPlan.notEditable.join(', ')} — these must move and the zone reports them ` +
+              `as not editable, which on Cloudflare means the setting is gated on the account's ` +
+              `plan`,
+          )
+        }
+        if (settingsPlan.missing.length > 0) {
+          parts.push(
+            `${settingsPlan.missing.join(', ')} — Cloudflare does not offer a setting under ` +
+              `these ids on this zone`,
+          )
+        }
+        throw new Error(
+          `refusing to apply: zone "${config.zone}" cannot converge every declared setting. ` +
+            `${parts.join('; ')}. Nothing was written — not the settings that could be, and not ` +
+            `the records — so this zone is exactly as the last apply left it.`,
+        )
+      }
+    }
+
+    // 4. Creates and updates always apply.
     for (const record of plan.create) {
       await cf(token, 'POST', `/zones/${zone.id}/dns_records`, recordBody(record))
       console.log(`    + created ${describeRecord(record)}`)
@@ -521,7 +688,7 @@ export const cloudflareZoneModule = defineModule({
       console.log(`    ~ updated ${describeRecord(current)} => ${describeRecord(wanted)}`)
     }
 
-    // 4. Deletions are printed always, performed only on opt-in.
+    // 5. Deletions are printed always, performed only on opt-in.
     let deleted = 0
     for (const record of plan.undeclared) {
       if (config.allowDelete) {
@@ -536,7 +703,19 @@ export const cloudflareZoneModule = defineModule({
       }
     }
 
-    const changed = plan.create.length + plan.update.length + deleted > 0
+    // 6. Settings last: a record that does not resolve yet is a smaller
+    //    problem than a zone whose HTTPS posture moved and whose records did
+    //    not, and only this order can fail before both.
+    for (const change of settingsPlan.change) {
+      await cf(token, 'PATCH', `/zones/${zone.id}/settings/${change.id}`, { value: change.to })
+      console.log(`    ~ setting ${describeSettingChange(change)}`)
+    }
+    for (const id of settingsPlan.unchanged) {
+      console.log(`    · setting ${id} already ${desiredSettings[id]}`)
+    }
+
+    const changed =
+      plan.create.length + plan.update.length + deleted + settingsPlan.change.length > 0
     if (!changed && plan.undeclared.length === 0) {
       console.log(`    = no changes`)
     }
@@ -549,6 +728,7 @@ export const cloudflareZoneModule = defineModule({
       updated: plan.update.length,
       deleted,
       undeclared: plan.undeclared.map(describeRecord),
+      settingsChanged: settingsPlan.change.map(describeSettingChange),
       emailProvisioned: plan.emailProvisioned.map(
         ({ record, purpose }) => `${describeRecord(record)} (${purpose})`,
       ),
