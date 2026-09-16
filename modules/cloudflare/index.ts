@@ -86,6 +86,52 @@ function wrangler(workdir: string, args: string[], env: NodeJS.ProcessEnv, input
   return combined
 }
 
+/**
+ * Which deploy this is, as a value the deployed code can be told.
+ *
+ * `GITHUB_SHA` in CI, `git rev-parse HEAD` locally. A dirty working tree gets a
+ * distinct id rather than the bare commit: a local apply builds the image from
+ * the working tree, so the same commit with edits is a different image, and
+ * handing it the commit's id would be the staleness this exists to prevent. The
+ * timestamp makes each such apply its own deploy, which is the honest answer
+ * when the content is whatever happened to be on disk.
+ *
+ * Absence is a hard error rather than a silent skip — see `deployIdVar`.
+ */
+function resolveDeployId(projectRoot: string, varName: string): string {
+  const fromCi = process.env.GITHUB_SHA?.trim()
+  if (fromCi) return fromCi
+
+  let head: string
+  try {
+    head = execSync('git rev-parse HEAD', {
+      cwd: projectRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+  } catch {
+    throw new Error(
+      `deployIdVar is set (${varName}) but this deploy has no id: GITHUB_SHA is unset and \`git rev-parse HEAD\` failed in ${projectRoot}. ` +
+        `Deploy from CI, from a git checkout, or drop deployIdVar.`,
+    )
+  }
+
+  let dirty = false
+  try {
+    dirty =
+      execSync('git status --porcelain', {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim() !== ''
+  } catch {
+    // A repository whose status cannot be read still has a HEAD worth
+    // reporting; treating that as clean is the same answer as before this
+    // check existed.
+  }
+  return dirty ? `${head}-dirty-${Date.now()}` : head
+}
+
 const buildSchema = z.object({
   command: z.string(),
   cwd: z.string().optional(),
@@ -475,12 +521,55 @@ export const cloudflareModule = defineModule({
      */
     bindings: z.array(bindingSchema).default([]),
     /**
-     * For container-backed Workers: roll the running container to the new image
-     * IMMEDIATELY on deploy (`--containers-rollout immediate`). The wrangler
-     * default is a GRADUAL rollout, which never drains a single always-warm,
-     * DO-bound container — so a redeployed image silently never takes effect
-     * until the container idle-sleeps. Set true whenever the image matters at
-     * deploy time. No-op for asset-only Workers.
+     * Name a Worker var after the deploy itself: the deployed commit
+     * (`GITHUB_SHA` in CI, `git rev-parse HEAD` locally, `<sha>-dirty-<ms>` on
+     * a working tree with changes), passed as `--var <name>:<id>` like any
+     * other var. Unset — the default — injects nothing.
+     *
+     * It is worth a key of its own because a var is the ONLY channel a Worker
+     * has for telling a container-backed payload that a deploy happened at all.
+     * `immediateContainerRollout` below rolls the container application to the
+     * new image and does not replace a running instance; a payload that reacts
+     * to its environment (walgit fingerprints it in a Durable Object and
+     * destroys the container when it moves) has nothing to react to when a
+     * deploy changed only code. This gives it something: every deploy from a
+     * new commit changes this value, and no deploy from the same commit does.
+     *
+     * Also the only place the deployed commit is written down — Cloudflare
+     * numbers container versions itself (v50, v51) and nothing else in a deploy
+     * names the code inside one.
+     *
+     * A var, so never a secret: it is a commit id, visible in the dashboard
+     * beside every other var, which is half the point.
+     *
+     * A HARD ERROR when no id can be resolved (not CI, not a git checkout).
+     * Silently omitting it would deploy the payload with no deploy marker,
+     * which is exactly the invisible staleness the key exists to prevent. An
+     * entry of the same name in `workerVars` takes precedence — the instance
+     * pinning a value outranks the module deriving one.
+     */
+    deployIdVar: z.string().optional(),
+    /**
+     * For container-backed Workers: roll the CONTAINER APPLICATION to the new
+     * image on deploy (`--containers-rollout immediate`) instead of wrangler's
+     * gradual default. Set true whenever the image matters at deploy time.
+     * No-op for asset-only Workers.
+     *
+     * WHAT IT DOES NOT DO — and the reason this paragraph exists — is replace a
+     * RUNNING instance. It rolls the application to a new version; a single
+     * always-warm, DO-bound instance is not drained by that rollout, and keeps
+     * serving the old image until it idle-sleeps, which under sustained traffic
+     * is never. Observed on walgit's 0.16.1 deploy (2026-09-14): the
+     * application moved to v51 with a new image, the rollout reported
+     * `completed`, and the instance answering git was the one started an hour
+     * earlier — the fix in that release was not live.
+     *
+     * It also has nothing to roll for a deploy that changes only vars: no new
+     * image, no new container version.
+     *
+     * So it is necessary and not sufficient. Replacing a running instance is
+     * the payload's own job, and `deployIdVar` above is what lets it know it
+     * has one to do.
      */
     immediateContainerRollout: z.boolean().default(false),
     /**
@@ -572,6 +661,17 @@ export const cloudflareModule = defineModule({
     const resolvedVars = config.workerVars.map((entry) =>
       resolveWorkerValue(entry, ctx, 'workerVars'),
     )
+    //    The deploy's own id, resolved here so a deploy with no id fails with
+    //    every other unresolvable reference rather than at wrangler. Last,
+    //    and skipped when `workerVars` already names it: a `--var` repeated
+    //    twice is a value wrangler picks between, and the instance's own entry
+    //    is the one that should win.
+    if (config.deployIdVar && !resolvedVars.some((v) => v.name === config.deployIdVar)) {
+      resolvedVars.push({
+        name: config.deployIdVar,
+        value: resolveDeployId(ctx.projectRoot, config.deployIdVar),
+      })
+    }
     const resolvedSecrets = config.workerSecrets.map((entry) =>
       resolveWorkerValue(entry, ctx, 'workerSecrets'),
     )

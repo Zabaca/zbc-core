@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { execSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
@@ -151,11 +151,14 @@ async function runApply(opts: {
   stubEnv?: Record<string, string>
   /** Written to `<workdir>/wrangler.jsonc` — the package's own wrangler config. */
   wranglerConfig?: string
+  /** Run against the freshly-created project root before `apply` (e.g. `git init`). */
+  prepare?: (root: string) => void
 }): Promise<{
   result?: { deployUrl: string }
   error?: Error
   calls: WranglerCall[]
   configs: Array<Record<string, unknown>>
+  root: string
 }> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-stub-'))
   createdRoots.push(root)
@@ -188,6 +191,7 @@ async function runApply(opts: {
     imports: opts.imports ?? {},
     projectRoot: root,
   }
+  opts.prepare?.(root)
 
   let result: { deployUrl: string } | undefined
   let error: Error | undefined
@@ -197,7 +201,7 @@ async function runApply(opts: {
     error = e as Error
   }
   const log = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : ''
-  return { result, error, calls: parseCalls(log), configs: parseConfigs(log) }
+  return { result, error, calls: parseCalls(log), configs: parseConfigs(log), root }
 }
 
 /** Run `destroy` against the same stubbed workdir; capture calls even on throw. */
@@ -747,5 +751,142 @@ describe('cloudflare apply — bindings resolve into the wrangler config', () =>
     expect(error).toBeUndefined()
     const env = configs[0].env as { preview: { d1_databases: Array<Record<string, string>> } }
     expect(env.preview.d1_databases[0].database_id).toBe('preview-db-id')
+  })
+})
+
+/**
+ * `deployIdVar` — the var that makes an image-only deploy visible.
+ *
+ * GITHUB_SHA is cleared for the whole block and restored afterwards: this suite
+ * runs in GitHub Actions too, where it is set, and two of these tests are about
+ * what happens when it is NOT.
+ */
+describe('cloudflare apply — deployIdVar names the deploy', () => {
+  const realSha = process.env.GITHUB_SHA
+  beforeEach(() => {
+    delete process.env.GITHUB_SHA
+  })
+  afterEach(() => {
+    if (realSha === undefined) delete process.env.GITHUB_SHA
+    else process.env.GITHUB_SHA = realSha
+  })
+
+  test('GITHUB_SHA reaches the deploy as --var under the configured name', async () => {
+    const { error, calls } = await runApply({
+      config: { deployIdVar: 'WALGIT_BUILD_ID' },
+      stubEnv: { GITHUB_SHA: '0123456789abcdef0123456789abcdef01234567' },
+    })
+
+    expect(error).toBeUndefined()
+    expect(deployCall(calls)?.argv).toContain(
+      'WALGIT_BUILD_ID:0123456789abcdef0123456789abcdef01234567',
+    )
+  })
+
+  test('unset, nothing is injected — an existing instance deploys exactly as before', async () => {
+    const { error, calls } = await runApply({
+      config: { workerVars: [{ name: 'WALGIT_PUBLIC', value: '1' }] },
+      stubEnv: { GITHUB_SHA: '0123456789abcdef0123456789abcdef01234567' },
+    })
+
+    expect(error).toBeUndefined()
+    expect(deployCall(calls)?.argv.filter((a) => a === '--var')).toHaveLength(1)
+    expect(deployCall(calls)?.argv).toContain('WALGIT_PUBLIC:1')
+  })
+
+  test('it rides alongside the declared vars rather than replacing them', async () => {
+    const { error, calls } = await runApply({
+      config: {
+        deployIdVar: 'WALGIT_BUILD_ID',
+        workerVars: [{ name: 'WALGIT_PUBLIC', value: '1' }],
+      },
+      stubEnv: { GITHUB_SHA: 'abc123' },
+    })
+
+    expect(error).toBeUndefined()
+    expect(deployCall(calls)?.argv).toContain('WALGIT_PUBLIC:1')
+    expect(deployCall(calls)?.argv).toContain('WALGIT_BUILD_ID:abc123')
+  })
+
+  test('a declared var of the same name wins, and is not deployed twice', async () => {
+    // Two `--var` flags with one name is a value the deploy picks between, so
+    // the instance's own entry is the one that ships.
+    const { error, calls } = await runApply({
+      config: {
+        deployIdVar: 'WALGIT_BUILD_ID',
+        workerVars: [{ name: 'WALGIT_BUILD_ID', value: 'pinned-by-the-instance' }],
+      },
+      stubEnv: { GITHUB_SHA: 'abc123' },
+    })
+
+    expect(error).toBeUndefined()
+    expect(deployCall(calls)?.argv).toContain('WALGIT_BUILD_ID:pinned-by-the-instance')
+    expect(deployCall(calls)?.argv).not.toContain('WALGIT_BUILD_ID:abc123')
+  })
+
+  /**
+   * A one-commit repository whose only tracked file is a `.gitignore` ignoring
+   * everything else — so the stub binary and the call log the harness drops in
+   * beside it do not read as a dirty tree.
+   */
+  const gitInit = (repo: string) => {
+    fs.writeFileSync(path.join(repo, '.gitignore'), '*\n')
+    execSync('git init -q && git add -f .gitignore && git commit -q -m first', {
+      cwd: repo,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: 't',
+        GIT_AUTHOR_EMAIL: 't@t',
+        GIT_COMMITTER_NAME: 't',
+        GIT_COMMITTER_EMAIL: 't@t',
+      },
+      shell: '/bin/sh',
+    })
+  }
+
+  test('outside CI the deployed commit comes from git', async () => {
+    // The local path: no GITHUB_SHA, and `git rev-parse HEAD` in the project
+    // root answers. The expected value comes from git itself rather than being
+    // recomputed the way the module computes it.
+    const { error, calls, root } = await runApply({
+      config: { deployIdVar: 'WALGIT_BUILD_ID' },
+      prepare: gitInit,
+    })
+    const head = execSync('git rev-parse HEAD', { cwd: root, encoding: 'utf8' }).trim()
+
+    expect(error).toBeUndefined()
+    expect(deployCall(calls)?.argv).toContain(`WALGIT_BUILD_ID:${head}`)
+  })
+
+  test('a working tree with changes deploys a distinct id, not the bare commit', async () => {
+    // A local apply builds the image from the WORKING TREE, so a dirty tree is
+    // a different image under the same commit. Reusing the bare sha there would
+    // be the exact bug this key exists to close.
+    const { error, calls, root } = await runApply({
+      config: { deployIdVar: 'WALGIT_BUILD_ID' },
+      prepare: (repo) => {
+        gitInit(repo)
+        // A modification to the one TRACKED file, so the tree is dirty by
+        // git's own account and not merely cluttered.
+        fs.appendFileSync(path.join(repo, '.gitignore'), '# edited\n')
+      },
+    })
+    const head = execSync('git rev-parse HEAD', { cwd: root, encoding: 'utf8' }).trim()
+
+    expect(error).toBeUndefined()
+    const injected = deployCall(calls)?.argv.find((a) => a.startsWith('WALGIT_BUILD_ID:'))
+    expect(injected).toStartWith(`WALGIT_BUILD_ID:${head}-dirty-`)
+  })
+
+  test('no CI sha and no git repository fails before wrangler runs', async () => {
+    // Fail fast, like every other unresolvable reference here: a deploy that
+    // silently omitted the var would leave the old container serving, which is
+    // the failure nobody notices.
+    const { error, calls } = await runApply({ config: { deployIdVar: 'WALGIT_BUILD_ID' } })
+
+    expect(error?.message).toContain('deployIdVar')
+    expect(error?.message).toContain('WALGIT_BUILD_ID')
+    expect(error?.message).toContain('GITHUB_SHA')
+    expect(calls).toHaveLength(0)
   })
 })
