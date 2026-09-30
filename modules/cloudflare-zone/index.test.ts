@@ -31,6 +31,7 @@ interface CfRecord {
   ttl: number
   proxied?: boolean
   priority?: number
+  data?: Record<string, unknown>
 }
 
 interface CfSetting {
@@ -48,6 +49,20 @@ interface StubState {
   settings?: Record<string, CfSetting[]>
   /** First-match override: return a CF envelope to short-circuit a route. */
   override?: (method: string, url: string) => unknown | undefined
+}
+
+/**
+ * What Cloudflare stores for a written SRV, as read back live on 2026-09-30:
+ * `content` is `weight port target` with no priority, and priority is a field
+ * of its own. The write sends only `data`; the stub derives the rest the same
+ * way, so a second apply compares against the shape the real API returns.
+ */
+function srvFields(data: Record<string, unknown>): Partial<CfRecord> {
+  return {
+    content: `${data.weight} ${data.port} ${data.target}`,
+    priority: data.priority as number,
+    data,
+  }
 }
 
 const realFetch = globalThis.fetch
@@ -120,6 +135,7 @@ function installFetchStub(state: StubState): { calls: RecordedCall[]; state: Stu
         ttl: Number(body.ttl ?? 1),
         proxied: body.proxied as boolean | undefined,
         priority: body.priority as number | undefined,
+        ...(body.data ? srvFields(body.data as Record<string, unknown>) : {}),
       }
       state.records ??= {}
       ;(state.records[zoneId] ??= []).push(created)
@@ -148,6 +164,7 @@ function installFetchStub(state: StubState): { calls: RecordedCall[]; state: Stu
           ttl: Number(body.ttl ?? list[index]!.ttl),
           proxied: 'proxied' in body ? (body.proxied as boolean) : list[index]!.proxied,
           priority: 'priority' in body ? (body.priority as number) : list[index]!.priority,
+          ...(body.data ? srvFields(body.data as Record<string, unknown>) : {}),
         }
         list[index] = updated
         return respond(envelope(updated))
@@ -818,5 +835,179 @@ describe('cloudflare-zone apply — zone settings', () => {
     expect(error).toBeUndefined()
     expect(result!.settingsChanged).toEqual(['always_use_https: off => on'])
     expect(result!.changed).toBe(true)
+  })
+})
+
+/**
+ * The record Outlook uses to find a mail server, as a client zone carries it.
+ * `liveAutodiscover` is that record exactly as `GET /dns_records` returned it
+ * on 2026-09-30: the dashboard shows `10 10 443 target`, the API's `content`
+ * drops the priority and reports it beside.
+ */
+const AUTODISCOVER = {
+  type: 'SRV',
+  name: '_autodiscover._tcp',
+  priority: 10,
+  weight: 10,
+  port: 443,
+  target: 'autodiscover.hostingplatform.com',
+}
+const liveAutodiscover = (overrides: Partial<CfRecord> = {}): CfRecord => ({
+  id: 'rec-srv',
+  type: 'SRV',
+  name: `_autodiscover._tcp.${ZONE}`,
+  content: '10 443 autodiscover.hostingplatform.com',
+  priority: 10,
+  data: { port: 443, priority: 10, target: 'autodiscover.hostingplatform.com', weight: 10 },
+  ttl: 1,
+  proxied: false,
+  ...overrides,
+})
+
+describe('cloudflare-zone configSchema: SRV', () => {
+  test('a complete SRV parses, with the automatic TTL by default', () => {
+    const config = parseConfig({ records: [AUTODISCOVER] })
+    expect(config.records[0]).toEqual({ ...AUTODISCOVER, ttl: 1 } as never)
+  })
+
+  test('SRV with `proxied` is rejected; an SRV cannot pass through the proxy', () => {
+    expect(() => parseConfig({ records: [{ ...AUTODISCOVER, proxied: false }] })).toThrow()
+  })
+
+  test('SRV with a `content` string is rejected; its fields are declared one by one', () => {
+    expect(() =>
+      parseConfig({
+        records: [{ ...AUTODISCOVER, content: '10 10 443 autodiscover.hostingplatform.com' }],
+      }),
+    ).toThrow()
+  })
+
+  for (const field of ['priority', 'weight', 'port', 'target'] as const) {
+    test(`SRV without \`${field}\` is rejected`, () => {
+      const { [field]: _, ...rest } = AUTODISCOVER
+      expect(() => parseConfig({ records: [rest] })).toThrow()
+    })
+  }
+
+  for (const field of ['priority', 'weight', 'port'] as const) {
+    for (const value of [-1, 65536, 1.5]) {
+      test(`SRV with ${field} ${value} is rejected`, () => {
+        expect(() => parseConfig({ records: [{ ...AUTODISCOVER, [field]: value }] })).toThrow()
+      })
+    }
+  }
+})
+
+describe('cloudflare-zone apply: SRV', () => {
+  test('a declared SRV is created from `data`, not `content`', async () => {
+    const { error, calls } = await runApply({
+      config: { records: [AUTODISCOVER] },
+      state: { records: { 'zone-1': [] } },
+    })
+    expect(error).toBeUndefined()
+    const posts = byMethod(calls, 'POST')
+    expect(posts).toHaveLength(1)
+    // No `content` (Cloudflare derives it), no `proxied`, no top-level priority.
+    expect(posts[0]!.body).toEqual({
+      type: 'SRV',
+      name: '_autodiscover._tcp.example.test',
+      ttl: 1,
+      data: { priority: 10, weight: 10, port: 443, target: 'autodiscover.hostingplatform.com' },
+    })
+  })
+
+  test('a second converge over a created SRV issues ZERO mutating calls', async () => {
+    const stub = installFetchStub({ zones: ZONES, records: { 'zone-1': [] } })
+    const first = await runApply({ config: { records: [AUTODISCOVER] }, stub })
+    expect(mutations(first.calls)).toHaveLength(1)
+    const second = await runApply({ config: { records: [AUTODISCOVER] }, stub })
+    expect(second.error).toBeUndefined()
+    expect(mutations(second.calls)).toHaveLength(0)
+    expect(second.result?.changed).toBe(false)
+  })
+
+  // The adoption case: the record already exists, and declaring it must be a
+  // no-op however Cloudflare or the operator spelled the target.
+  const spellings: Array<[string, { live: string; declared: string }]> = [
+    [
+      'as the API returns it',
+      { live: 'autodiscover.hostingplatform.com', declared: 'autodiscover.hostingplatform.com' },
+    ],
+    [
+      'with a trailing dot live',
+      { live: 'autodiscover.hostingplatform.com.', declared: 'autodiscover.hostingplatform.com' },
+    ],
+    [
+      'with a trailing dot declared',
+      { live: 'autodiscover.hostingplatform.com', declared: 'autodiscover.hostingplatform.com.' },
+    ],
+    [
+      'uppercased live',
+      { live: 'AutoDiscover.HostingPlatform.com', declared: 'autodiscover.hostingplatform.com' },
+    ],
+    [
+      'uppercased declared',
+      { live: 'autodiscover.hostingplatform.com', declared: 'AUTODISCOVER.HOSTINGPLATFORM.COM' },
+    ],
+  ]
+  for (const [label, { live, declared }] of spellings) {
+    test(`declaring the live SRV ${label} converges with ZERO mutating calls`, async () => {
+      const { result, error, calls } = await runApply({
+        config: { records: [{ ...AUTODISCOVER, target: declared }] },
+        state: { records: { 'zone-1': [liveAutodiscover({ content: `10 443 ${live}` })] } },
+      })
+      expect(error).toBeUndefined()
+      expect(mutations(calls)).toHaveLength(0)
+      expect(result?.changed).toBe(false)
+      expect(result?.undeclared).toEqual([])
+    })
+  }
+
+  // Priority is the case most likely to be missed: it is not in `content`.
+  for (const change of [{ port: 8443 }, { weight: 20 }, { priority: 0 }]) {
+    const [field, value] = Object.entries(change)[0]!
+    test(`a changed ${field} is a PATCH on the same record id, and then settles`, async () => {
+      const stub = installFetchStub({ zones: ZONES, records: { 'zone-1': [liveAutodiscover()] } })
+      const wanted = { ...AUTODISCOVER, ...change }
+      const { result, error, calls } = await runApply({ config: { records: [wanted] }, stub })
+      expect(error).toBeUndefined()
+      const patches = byMethod(calls, 'PATCH')
+      expect(patches).toHaveLength(1)
+      expect(patches[0]!.url).toContain('/dns_records/rec-srv')
+      expect((patches[0]!.body as { data: Record<string, unknown> }).data).toEqual({
+        priority: wanted.priority,
+        weight: wanted.weight,
+        port: wanted.port,
+        target: wanted.target,
+      })
+      expect((patches[0]!.body as { data: Record<string, unknown> }).data[field]).toBe(value)
+      expect(byMethod(calls, 'POST')).toHaveLength(0)
+      expect(byMethod(calls, 'DELETE')).toHaveLength(0)
+      expect(result?.updated).toBe(1)
+
+      const again = await runApply({ config: { records: [wanted] }, stub })
+      expect(mutations(again.calls)).toHaveLength(0)
+    })
+  }
+
+  test('an undeclared SRV is drift, printed with all four numbers, and not email-provisioned', async () => {
+    const stub = installFetchStub({ zones: ZONES, records: { 'zone-1': [liveAutodiscover()] } })
+    const { result, error } = await runApply({ config: { records: [] }, stub })
+    expect(error).toBeUndefined()
+    expect(result?.undeclared).toEqual([
+      'SRV _autodiscover._tcp.example.test -> 10 10 443 autodiscover.hostingplatform.com',
+    ])
+    expect(result?.emailProvisioned).toEqual([])
+    expect(byMethod(stub.calls, 'DELETE')).toHaveLength(0)
+  })
+
+  test('an undeclared SRV is deleted only with allowDelete', async () => {
+    const stub = installFetchStub({ zones: ZONES, records: { 'zone-1': [liveAutodiscover()] } })
+    const { result, error } = await runApply({ config: { records: [], allowDelete: true }, stub })
+    expect(error).toBeUndefined()
+    const deletes = byMethod(stub.calls, 'DELETE')
+    expect(deletes).toHaveLength(1)
+    expect(deletes[0]!.url).toContain('/dns_records/rec-srv')
+    expect(result?.deleted).toBe(1)
   })
 })

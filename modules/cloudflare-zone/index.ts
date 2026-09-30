@@ -138,6 +138,26 @@ const recordSchema = z.discriminatedUnion('type', [
       ttl: ttlField,
     })
     .strict(),
+  /**
+   * Declared as its four fields rather than as one `content` string, because
+   * no single string means the same thing on both sides: the dashboard shows
+   * `priority weight port target`, while the API's `content` is
+   * `weight port target` with priority in a field of its own. A copied
+   * dashboard value would shift every number one place. See `desiredRecord`.
+   */
+  z
+    .object({
+      type: z.literal('SRV'),
+      /** The `_service._proto` label, e.g. `_autodiscover._tcp`. */
+      name: z.string(),
+      priority: z.number().int().min(0).max(65535),
+      weight: z.number().int().min(0).max(65535),
+      port: z.number().int().min(0).max(65535),
+      /** The host the service lives on. */
+      target: z.string().min(1),
+      ttl: ttlField,
+    })
+    .strict(),
 ])
 
 export type RecordConfig = z.infer<typeof recordSchema>
@@ -234,6 +254,9 @@ export function fqdn(name: string, zone: string): string {
  * Comparable form of a record's content. Cloudflare round-trips TXT values
  * with surrounding quotes in some API versions and normalises hostname targets
  * to lowercase without a trailing dot; neither difference is a change.
+ *
+ * An SRV's content is `weight port target`, and only the target is a hostname:
+ * the numbers compare as written, the last token as any other hostname does.
  */
 export function normalizeContent(type: string, content: string): string {
   const value = content.trim()
@@ -245,7 +268,20 @@ export function normalizeContent(type: string, content: string): string {
   if (type === 'CNAME' || type === 'MX' || type === 'NS' || type === 'AAAA') {
     return value.replace(/\.$/, '').toLowerCase()
   }
+  if (type === 'SRV') {
+    const tokens = value.split(/\s+/)
+    const target = tokens.pop() ?? ''
+    return [...tokens, target.replace(/\.$/, '').toLowerCase()].join(' ')
+  }
   return value
+}
+
+/** What Cloudflare's create and PATCH take for an SRV, in place of `content`. */
+export interface SrvData {
+  priority: number
+  weight: number
+  port: number
+  target: string
 }
 
 export interface DesiredRecord {
@@ -256,6 +292,38 @@ export interface DesiredRecord {
   ttl: number
   proxied?: boolean
   priority?: number
+  /** SRV only: the fields `content` and `priority` were derived from. */
+  data?: SrvData
+}
+
+/**
+ * One declared record in the shape the live one is compared against. For an
+ * SRV that is the API's shape, not the dashboard's: `content` is
+ * `weight port target` and priority rides alongside, exactly as
+ * `GET /dns_records` returns it, so `sameValue` and `differs` need no SRV case.
+ * `data` is carried too, because it and not `content` is what the write sends.
+ */
+export function desiredRecord(record: RecordConfig, zone: string): DesiredRecord {
+  const name = fqdn(record.name, zone)
+  if (record.type === 'SRV') {
+    const { priority, weight, port, target } = record
+    return {
+      type: record.type,
+      name,
+      content: `${weight} ${port} ${target}`,
+      ttl: record.ttl,
+      priority,
+      data: { priority, weight, port, target },
+    }
+  }
+  return {
+    type: record.type,
+    name,
+    content: record.content,
+    ttl: record.ttl,
+    ...('proxied' in record ? { proxied: record.proxied } : {}),
+    ...('priority' in record ? { priority: record.priority } : {}),
+  }
 }
 
 export interface ActualRecord extends DesiredRecord {
@@ -323,7 +391,15 @@ function differs(desired: DesiredRecord, actual: DesiredRecord): boolean {
   return false
 }
 
-export const describeRecord = (r: DesiredRecord) => `${r.type} ${r.name} -> ${r.content}`
+/**
+ * An SRV is printed `priority weight port target`, the order the dashboard and
+ * a zone file use. Its `content` alone omits priority, and a drift line is what
+ * an operator copies into an instance, so it has to carry all four numbers.
+ */
+export const describeRecord = (r: DesiredRecord) =>
+  r.type === 'SRV'
+    ? `${r.type} ${r.name} -> ${r.priority ?? 0} ${r.content}`
+    : `${r.type} ${r.name} -> ${r.content}`
 
 export interface ZonePlan {
   create: DesiredRecord[]
@@ -562,6 +638,11 @@ async function listRecords(token: string, zoneId: string): Promise<ActualRecord[
 
 /** The request body Cloudflare wants for one declared record. */
 function recordBody(record: DesiredRecord): Record<string, unknown> {
+  // An SRV is written as its fields; `content` is what Cloudflare derives from
+  // them, and priority lives only inside `data`.
+  if (record.data) {
+    return { type: record.type, name: record.name, ttl: record.ttl, data: record.data }
+  }
   const body: Record<string, unknown> = {
     type: record.type,
     name: record.name,
@@ -617,14 +698,7 @@ export const cloudflareZoneModule = defineModule({
     }
 
     // 2. Diff the whole zone before mutating any of it.
-    const desired = config.records.map((record) => ({
-      type: record.type,
-      name: fqdn(record.name, config.zone),
-      content: record.content,
-      ttl: record.ttl,
-      ...('proxied' in record ? { proxied: record.proxied } : {}),
-      ...('priority' in record ? { priority: record.priority } : {}),
-    }))
+    const desired = config.records.map((record) => desiredRecord(record, config.zone))
     const actual = await listRecords(token, zone.id)
     const plan = planZone({ desired, actual })
 
