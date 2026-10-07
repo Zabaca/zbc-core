@@ -570,6 +570,15 @@ export const cloudflareModule = defineModule({
      * So it is necessary and not sufficient. Replacing a running instance is
      * the payload's own job, and `deployIdVar` above is what lets it know it
      * has one to do.
+     *
+     * `default` SCHEDULING POLICY ONLY. A container application under the
+     * `durable_object` policy has no rollouts at all — its Durable Object
+     * picks an image from `ctx.container.images` each time it starts one —
+     * and wrangler (4.147) accepts the flag on such a Worker and applies it to
+     * the `default`-policy applications alone, skipping the others without a
+     * word. So it is harmless to leave set across a migration between the two
+     * (walgit carries one of each while its old application is retired), and
+     * meaningless once a Worker has only `durable_object` containers.
      */
     immediateContainerRollout: z.boolean().default(false),
     /**
