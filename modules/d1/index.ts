@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { defineModule } from '../../src/define-module'
+import type { ApplyContext } from '../../src/types'
 import { CfError, type CfOptions, cf, cfRaw } from '../cloudflare-api'
 
 /**
@@ -16,7 +17,10 @@ import { CfError, type CfOptions, cf, cfRaw } from '../cloudflare-api'
  * 'database_id', from: '<this instance>', output: 'databaseId' }` and the
  * placeholder id in the checked-in wrangler config is never read.
  *
- * Token scope: CLOUDFLARE_API_TOKEN needs Account → D1: Edit.
+ * Token scope: CLOUDFLARE_API_TOKEN needs Account → D1: Edit. Or set
+ * `apiToken: { from, output }` to use an imported instance's output instead
+ * (e.g. a `cloudflare-token` instance's `tokenValue`), the same way the
+ * `cloudflare` module takes its deploy credential.
  */
 
 /** Named per-code guidance for this module's calls — see `../cloudflare-api`. */
@@ -118,11 +122,33 @@ function isDuplicateColumn(err: unknown): boolean {
   return err instanceof CfError && /duplicate column name/i.test(err.message)
 }
 
+/**
+ * The credential every call below uses: an imported instance's output when
+ * `apiToken` is set, else CLOUDFLARE_API_TOKEN from secrets.yaml. One helper
+ * so apply, destroy and the readiness probe can never disagree on it.
+ */
+function apiTokenFor(
+  config: { apiToken?: { from: string; output: string } },
+  ctx: ApplyContext,
+): string {
+  return config.apiToken
+    ? ctx.output(config.apiToken, 'apiToken')
+    : ctx.secret('CLOUDFLARE_API_TOKEN')
+}
+
 export const d1Module = defineModule({
   name: 'd1',
   configSchema: z.object({
     /** Cloudflare account id (not a secret — it's in the dashboard URL). */
     accountId: z.string(),
+    /**
+     * Where the credential comes from. Omit to read CLOUDFLARE_API_TOKEN from
+     * this environment's secrets.yaml. Set `{ from, output }` to pull it from
+     * an imported instance's outputs instead — e.g. a minted `cloudflare-token`
+     * whose permissions include D1 Read and D1 Write — so it never sits at
+     * rest. Mirrors the `cloudflare` module's `apiToken`.
+     */
+    apiToken: z.object({ from: z.string(), output: z.string() }).optional(),
     /** Database name — account-scoped, so namespace it per project/env. */
     databaseName: z.string(),
     /**
@@ -154,7 +180,7 @@ export const d1Module = defineModule({
     databaseId: z.string(),
   }),
   async apply(config, ctx) {
-    const apiToken = ctx.secret('CLOUDFLARE_API_TOKEN')
+    const apiToken = apiTokenFor(config, ctx)
     const { accountId, databaseName } = config
 
     const existing = (await listDatabases(apiToken, accountId)).find((d) => d.name === databaseName)
@@ -211,7 +237,7 @@ export const d1Module = defineModule({
    * strand every instance behind it in a `zbc destroy`.
    */
   async destroy(config, ctx) {
-    const apiToken = ctx.secret('CLOUDFLARE_API_TOKEN')
+    const apiToken = apiTokenFor(config, ctx)
     const { accountId, databaseName } = config
     // The lookup is deliberately OUTSIDE the try: the forgiving case is
     // "already gone", and that is the `!existing` branch. A listing that failed
@@ -246,7 +272,7 @@ export const d1Module = defineModule({
   ready: {
     proves: 'the database answers a query',
     async probe(outputs, config, ctx) {
-      const apiToken = ctx.secret('CLOUDFLARE_API_TOKEN')
+      const apiToken = apiTokenFor(config, ctx)
       await query(apiToken, config.accountId, outputs.databaseId, 'SELECT 1')
     },
   },

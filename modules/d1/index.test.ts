@@ -310,3 +310,58 @@ describe('readiness', () => {
     expect(calls[0]!.path).toBe('/client/v4/accounts/acct-1/d1/database/uuid-1/query')
   })
 })
+
+describe('apiToken from an imported instance', () => {
+  /** Every Authorization header the API saw, wrapped around the usual stub. */
+  function recordTokens(): string[] {
+    const tokens: string[] = []
+    const stub = globalThis.fetch
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      tokens.push(new Headers(init?.headers).get('authorization') ?? '')
+      return stub(input, init)
+    }) as typeof fetch
+    return tokens
+  }
+  const minted = () =>
+    createTestContext({
+      secrets: { CLOUDFLARE_API_TOKEN: 'tok' },
+      imports: { 'deploy-token': { tokenValue: 'minted-tok', tokenId: 'tok-1' } },
+    })
+  const fromImport = { apiToken: { from: 'deploy-token', output: 'tokenValue' } }
+
+  test('apply, destroy and the probe all use the imported value, not secrets.yaml', async () => {
+    installFetchStub({ databases: [['proj-prod', 'uuid-1']] })
+    const tokens = recordTokens()
+    const c = minted()
+    await d1Module.apply(config({ ...fromImport, statements: ['SELECT 1'] }), c)
+    await d1Module.ready!.probe(
+      { databaseName: 'proj-prod', databaseId: 'uuid-1' },
+      config(fromImport),
+      c,
+    )
+    await d1Module.destroy!(config(fromImport), c)
+
+    expect(tokens.length).toBeGreaterThan(0)
+    expect(new Set(tokens)).toEqual(new Set(['Bearer minted-tok']))
+    expect(c.secretsRead).not.toContain('CLOUDFLARE_API_TOKEN')
+  })
+
+  test('omitted apiToken keeps the secrets.yaml fallback', async () => {
+    installFetchStub({ databases: [['proj-prod', 'uuid-1']] })
+    const tokens = recordTokens()
+    await d1Module.apply(config(), ctx())
+    expect(new Set(tokens)).toEqual(new Set(['Bearer tok']))
+  })
+
+  test('an apiToken naming an instance that is not imported fails before any call', async () => {
+    const calls = installFetchStub({ databases: [['proj-prod', 'uuid-1']] })
+    let error: Error | undefined
+    try {
+      await d1Module.apply(config({ apiToken: { from: 'ghost', output: 'tokenValue' } }), ctx())
+    } catch (e) {
+      error = e as Error
+    }
+    expect(error?.message).toContain('ghost')
+    expect(calls).toHaveLength(0)
+  })
+})
