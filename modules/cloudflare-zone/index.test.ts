@@ -41,8 +41,8 @@ interface CfSetting {
 }
 
 interface StubState {
-  /** zone name → the zone as the API would report it. */
-  zones?: Record<string, { id: string; accountId: string; nameServers?: string[] }>
+  /** zone name → the zone as the API would report it. `POST /zones` adds to it. */
+  zones?: Record<string, { id: string; accountId: string; nameServers?: string[]; status?: string }>
   /** zone id → its records. Mutated in place by POST/PATCH/DELETE. */
   records?: Record<string, CfRecord[]>
   /** zone id → its settings, as `GET /zones/:id/settings` reports them. */
@@ -67,6 +67,15 @@ function srvFields(data: Record<string, unknown>): Partial<CfRecord> {
 
 const realFetch = globalThis.fetch
 const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+
+/** A stub zone as `GET /zones` and `POST /zones` report it. */
+const zoneView = (name: string, zone: NonNullable<StubState['zones']>[string]) => ({
+  id: zone.id,
+  name,
+  status: zone.status ?? 'active',
+  account: { id: zone.accountId },
+  name_servers: zone.nameServers ?? ['ns1.example', 'ns2.example'],
+})
 
 function installFetchStub(state: StubState): { calls: RecordedCall[]; state: StubState } {
   const calls: RecordedCall[] = []
@@ -98,20 +107,19 @@ function installFetchStub(state: StubState): { calls: RecordedCall[]; state: Stu
     if (method === 'GET' && path === '/client/v4/zones') {
       const name = u.searchParams.get('name') ?? ''
       const zone = state.zones?.[name]
-      return respond(
-        envelope(
-          zone
-            ? [
-                {
-                  id: zone.id,
-                  name,
-                  account: { id: zone.accountId },
-                  name_servers: zone.nameServers ?? ['ns1.example', 'ns2.example'],
-                },
-              ]
-            : [],
-        ),
-      )
+      return respond(envelope(zone ? [zoneView(name, zone)] : []))
+    }
+    if (method === 'POST' && path === '/client/v4/zones') {
+      // A new zone, as Cloudflare answers it: pending, with its own pair.
+      const body = call.body as { name: string; account: { id: string } }
+      const zone = {
+        id: `zone-created-${nextId++}`,
+        accountId: body.account.id,
+        nameServers: ['ana.ns.cloudflare.com', 'bob.ns.cloudflare.com'],
+        status: 'pending',
+      }
+      state.zones = { ...state.zones, [body.name]: zone }
+      return respond(envelope(zoneView(body.name, zone)))
     }
 
     const listMatch = /^\/client\/v4\/zones\/([^/]+)\/dns_records$/.exec(path)
@@ -721,6 +729,120 @@ describe('cloudflare-zone apply — hard errors are fail-fast', () => {
     })
     expect(error).toBeDefined()
     expect(error!.message).toContain('record already exists')
+  })
+})
+
+const isZoneCreate = (c: RecordedCall) => c.method === 'POST' && c.url.endsWith('/zones')
+
+describe('cloudflare-zone apply: creating the zone', () => {
+  const NEW = 'new-client.test'
+
+  test('with createIfAbsent false (the default) an absent zone is an error naming the key, and nothing is created', async () => {
+    const { error, calls } = await runApply({ config: { zone: NEW }, state: { zones: {} } })
+    expect(error?.message).toContain(NEW)
+    expect(error?.message).toContain('createIfAbsent')
+    expect(mutations(calls)).toHaveLength(0)
+  })
+
+  test('with createIfAbsent true an absent zone is created in the declared account, then its records', async () => {
+    const { result, error, calls } = await runApply({
+      config: { zone: NEW, createIfAbsent: true, records: [APEX_AAAA] },
+      state: { zones: {} },
+    })
+    expect(error).toBeUndefined()
+    const posts = byMethod(calls, 'POST')
+    expect(posts).toHaveLength(2)
+    expect(posts[0]!.url).toBe('https://api.cloudflare.com/client/v4/zones')
+    expect(posts[0]!.body).toEqual({ name: NEW, account: { id: 'acct-1' }, type: 'full' })
+    // The record lands in the zone just created.
+    expect(posts[1]!.url).toMatch(/\/zones\/zone-created-\d+\/dns_records$/)
+    expect(result!.zoneCreated).toBe(true)
+    expect(result!.zoneStatus).toBe('pending')
+    expect(result!.nameServers).toEqual(['ana.ns.cloudflare.com', 'bob.ns.cloudflare.com'])
+  })
+
+  test('the apply after the creating one finds the zone and mutates nothing', async () => {
+    const stub = installFetchStub({ zones: {} })
+    const config = { zone: NEW, createIfAbsent: true, records: [APEX_AAAA] }
+    const first = await runApply({ config, stub })
+    expect(first.error).toBeUndefined()
+    const second = await runApply({ config, stub })
+    expect(second.error).toBeUndefined()
+    expect(mutations(second.calls)).toHaveLength(0)
+    expect(second.result!.zoneCreated).toBe(false)
+    expect(second.result!.zoneId).toBe(first.result!.zoneId)
+  })
+
+  test('a zone that already exists is never created, whatever createIfAbsent says', async () => {
+    const { result, error, calls } = await runApply({ config: { createIfAbsent: true } })
+    expect(error).toBeUndefined()
+    expect(calls.filter(isZoneCreate)).toHaveLength(0)
+    expect(result!.zoneCreated).toBe(false)
+    expect(result!.zoneStatus).toBe('active')
+  })
+
+  test('a zone in another account is refused before any create, even with createIfAbsent', async () => {
+    const { error, calls } = await runApply({
+      config: { accountId: 'acct-other', createIfAbsent: true },
+      state: { zones: ZONES },
+    })
+    expect(error?.message).toContain('acct-other')
+    expect(mutations(calls)).toHaveLength(0)
+  })
+
+  test('a refused create says the zone may exist where the token cannot read it, and writes no record', async () => {
+    const { error, calls } = await runApply({
+      config: { zone: NEW, createIfAbsent: true, records: [APEX_AAAA] },
+      state: {
+        zones: {},
+        override: (method, url) =>
+          method === 'POST' && url.endsWith('/zones')
+            ? {
+                success: false,
+                errors: [{ code: 1061, message: `${NEW} already exists` }],
+                result: null,
+              }
+            : undefined,
+      },
+    })
+    expect(error?.message).toContain('already exists')
+    expect(error?.message).toContain('Zone Read')
+    expect(calls.filter((c) => c.url.includes('/dns_records'))).toHaveLength(0)
+  })
+
+  test('every apply prints the nameservers and status; only a pending zone points at the registrar', async () => {
+    const pending = await captureLog(() =>
+      runApply({ config: { zone: NEW, createIfAbsent: true }, state: { zones: {} } }),
+    )
+    expect(pending).toContain(`Created zone ${NEW}`)
+    expect(pending).toContain('Nameservers (pending): ana.ns.cloudflare.com, bob.ns.cloudflare.com')
+    expect(pending).toContain('registrar')
+    const active = await captureLog(() => runApply({}))
+    expect(active).toContain('Nameservers (active): ns1.example, ns2.example')
+    expect(active).not.toContain('registrar')
+  })
+
+  test('an apply that creates the zone and then refuses still printed the pair, and says the zone exists', async () => {
+    let outcome: Awaited<ReturnType<typeof runApply>> | undefined
+    // The new zone reports no settings, so the declared one is refused in the
+    // plan, after the create and before any record is written.
+    const log = await captureLog(async () => {
+      outcome = await runApply({
+        config: {
+          zone: NEW,
+          createIfAbsent: true,
+          records: [APEX_AAAA],
+          settings: { always_use_https: 'on' },
+        },
+        state: { zones: {} },
+      })
+    })
+    expect(outcome!.error?.message).toContain('created the zone itself (pending)')
+    expect(outcome!.error?.message).not.toContain('exactly as the last apply left it')
+    expect(log).toContain('Nameservers (pending): ana.ns.cloudflare.com, bob.ns.cloudflare.com')
+    expect(
+      outcome!.calls.filter((c) => c.url.includes('/dns_records') && c.method === 'POST'),
+    ).toHaveLength(0)
   })
 })
 
