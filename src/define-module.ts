@@ -98,14 +98,31 @@ export function defineModule<TConfig extends z.ZodType, TOutputs extends z.ZodTy
     // present-but-empty key the engine would have to special-case.
     ...(opts.secretOutputs ? { secretOutputs: opts.secretOutputs } : {}),
     instance(instanceOpts: InstanceOptions<TConfig>): ModuleInstance<TOutputs> {
+      const ephemeral =
+        instanceOpts.ephemeral ?? legacyConfigEphemeral(opts.name, instanceOpts.config)
+      const retain = instanceOpts.retain === true
+      if (retain && ephemeral) {
+        throw new Error(
+          `Instance "${instanceOpts.name}" sets retain and ephemeral: ephemeral destroys it on ` +
+            `every apply, and retain says nothing may. Drop one.`,
+        )
+      }
       return {
         name: instanceOpts.name,
         moduleName: opts.name,
         config: instanceOpts.config,
         imports: instanceOpts.imports ?? [],
-        ephemeral: instanceOpts.ephemeral ?? legacyConfigEphemeral(opts.name, instanceOpts.config),
+        ephemeral,
+        ...(retain ? { retain } : {}),
         _outputsSchema: opts.outputs,
-        _definition: definition as ModuleDefinition<any, TOutputs>,
+        // A retained instance carries NO destroy, rather than a flag the
+        // engine has to remember to read: an engine older than `retain` then
+        // finds nothing to call and skips it, as it skips any module without
+        // one. The newer engine reads `retain` only to say why, and to refuse
+        // a targeted destroy rather than skip it.
+        _definition: (retain
+          ? { ...definition, destroy: undefined }
+          : definition) as ModuleDefinition<any, TOutputs>,
       }
     },
   }

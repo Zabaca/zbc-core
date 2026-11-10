@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { defineModule } from '../../src/define-module'
+import type { ApplyContext } from '../../src/types'
 import { cf } from '../cloudflare-api'
 
 // cloudflare-access — a Zero Trust application and the list of principals that
@@ -25,6 +26,17 @@ import { cf } from '../cloudflare-api'
 // which would let an `everyone` rule sit beside the addresses on the people
 // policy and read as unchanged. `planPolicies` is the seam that keeps it, and
 // `index.test.ts` fails if anybody widens it.
+//
+// ── A THIRD KIND, AND IT IS THE DANGEROUS ONE: BYPASS ─────────────────────
+// `bypass: true` declares an application whose one policy is Cloudflare's
+// Bypass for everyone: the edge asks for no sign-in on that path and passes the
+// request through with no assertion. It exists for a path nested under a gated
+// host whose Worker authenticates every request on it itself (a guest's link,
+// a signer's private URL). It has its own reader (`policyEveryone`), it refuses
+// to be declared beside people or tokens, and the people and Service Auth
+// readers still return null on it, so it cannot be mistaken for a match and a
+// people policy that gains an `everyone` rule is still rewritten. Every apply
+// of one prints a BYPASS line.
 //
 // ── THE ORGANISATION IS NOT SCOPED TO THIS APPLICATION ────────────────────
 // `teamDomain`, `orgName` and `identityProviders` are properties of the whole
@@ -80,11 +92,20 @@ const configSchema = z
      * `tokenValue`. Not a secrets.yaml key, so nothing that can edit who
      * reaches this application comes to rest in the consuming repo.
      *
+     * Or `{ secret }`: a key of this environment's secrets.yaml, for an
+     * environment that mints no tokens and applies Access with the deploy
+     * credential it already holds (`{ secret: 'CLOUDFLARE_API_TOKEN' }`). That
+     * credential is at rest in the consuming repo, so this form trades the
+     * property above for not needing a root token to mint one.
+     *
      * Needs "Access: Apps and Policies Write", plus "Access: Service Tokens
      * Write" if `serviceTokenName` is declared, and "Access: Organizations" /
      * "Access: Identity Providers" for the organisation-level fields.
      */
-    apiToken: z.object({ from: z.string(), output: z.string() }),
+    apiToken: z.union([
+      z.object({ from: z.string(), output: z.string() }),
+      z.object({ secret: z.string() }),
+    ]),
     /**
      * The Zero Trust team domain, bare, with no scheme and no path.
      *
@@ -225,18 +246,87 @@ const configSchema = z
     /** `HttpOnly` on the Access cookie. On, matching Cloudflare's own default. */
     httpOnlyCookieAttribute: z.boolean().default(true),
     /**
+     * Scope the application's session cookie to its path (Cloudflare's
+     * `path_cookie_attribute`). Off by default, which is Cloudflare's own
+     * default.
+     *
+     * ON for an application nested under another on the same host (one on
+     * `/forms` under a whole-host one). With it off, both applications write
+     * ONE `CF_Authorization` cookie on the host with `Path=/`, and signing in
+     * to the narrower one replaces the wider one's session, so a month's
+     * sign-in falls to the narrower one's day. With it on, the narrow
+     * application's cookie is `Path=/forms` and the wide one's is never
+     * touched. That relies on browsers sending the cookie with the longer path
+     * first and Access reading the first `CF_Authorization` it is sent.
+     */
+    pathCookieAttribute: z.boolean().default(false),
+    /**
+     * The `SameSite` attribute of the application's session cookie
+     * (Cloudflare's `same_site_cookie_attribute`).
+     *
+     * NOT SET by default, and then the field is left out of the body AND out
+     * of the comparison: an application that does not declare it is neither
+     * written nor reported, and Cloudflare's own default (`none`) stays.
+     *
+     * `lax` suits an application whose pages and API are only ever used from
+     * its own host: a cookie a cross-site POST would carry is then not sent, so
+     * a page on another site cannot make the browser carry the sign-in into a
+     * write, while top-level navigations (Access's own callback, a followed
+     * link) still carry it. Leave it unset where a flow needs the cookie across
+     * sites, such as a silent renewal inside a frame.
+     */
+    sameSiteCookieAttribute: z.enum(['strict', 'lax', 'none']).optional(),
+    /**
      * Perform the deletions this module prints. False by default: an undeclared
      * policy is always reported, never removed, until an operator has read the
      * line and opted in.
      */
     allowDelete: z.boolean().default(false),
+    /**
+     * Make this a BYPASS application: Cloudflare's Bypass action for everyone,
+     * so the edge asks for no sign-in on `domain` and passes the request
+     * through with NO assertion. For a path whose own Worker authenticates
+     * every request itself (a guest's link, a signer's private URL).
+     *
+     * Off by default. When on, the application admits nobody by address or
+     * token (`emails`, `serviceTokens` and `serviceTokenName` must be empty),
+     * because an application that both bypasses and names people would read
+     * as a lock and be a door. It declares exactly one policy, named
+     * `policyName`, of kind `everyone`, compared by its own reader
+     * (`policyEveryone`).
+     *
+     * Declare `domain` as narrowly as the Worker's open paths are
+     * (`host/prefix/*`): Cloudflare serves the most specific application a
+     * request matches, so a bypass on a path takes that path, and nothing
+     * else, off a whole-host application's gate.
+     */
+    bypass: z.boolean().default(false),
   })
   .superRefine((config, ctx) => {
+    // A bypass names nobody by design: the rule for it is that it names nobody
+    // at all, and the "no way in" rule below is the one it is exempt from.
+    if (
+      config.bypass &&
+      (config.emails.length > 0 ||
+        config.serviceTokens.length > 0 ||
+        config.serviceTokenName !== undefined)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['bypass'],
+        message:
+          'a bypass application admits everyone without a sign-in, so it cannot also name people ' +
+          'or service tokens: emails, serviceTokens and serviceTokenName must be empty. Declare ' +
+          'the people on the application that gates the rest of the host.',
+      })
+    }
+
     // An application with neither a person nor a machine on it is one nobody
     // can reach, and it should be deleted rather than emptied. The generalised
     // form of "refuse an empty allow list": emails are no longer the only kind
     // of principal, so the rule is about the union.
     if (
+      !config.bypass &&
       config.emails.length === 0 &&
       config.serviceTokens.length === 0 &&
       config.serviceTokenName === undefined
@@ -356,6 +446,24 @@ export function policyServiceTokens(policy: Pick<AccessPolicy, 'include'>): stri
 }
 
 /**
+ * Whether a live policy admits EXACTLY everyone: its `include` is the one rule
+ * `{ everyone: {} }` and nothing else.
+ *
+ * The third reader, beside `policyEmails` and `policyServiceTokens`, and it
+ * keeps their property from the other side. Those two return null on an
+ * `everyone` rule, so a bypass can never pass for a people policy; this one is
+ * false on anything but a lone `everyone`, so a bypass whose policy also
+ * carries a second, narrower include is rewritten rather than read as
+ * unchanged.
+ */
+export function policyEveryone(policy: Pick<AccessPolicy, 'include'>): boolean {
+  const include = policy.include ?? []
+  if (include.length !== 1) return false
+  const keys = Object.keys(include[0] ?? {})
+  return keys.length === 1 && keys[0] === 'everyone'
+}
+
+/**
  * One policy this instance declares, and the whole of what it admits.
  *
  * TWO KINDS, and the difference between them is precisely the thing that must
@@ -378,6 +486,11 @@ export type DeclaredPolicy =
       tokenIds: readonly string[]
       sessionDuration?: string
     }
+  | {
+      /** Cloudflare's Bypass for everyone: no sign-in at all. Only `bypass: true` declares it. */
+      name: string
+      admits: 'everyone'
+    }
 
 /**
  * What Cloudflare calls the action, per kind.
@@ -389,12 +502,14 @@ export type DeclaredPolicy =
  * decision is part of what is compared rather than something set once at
  * creation.
  */
-export function decisionFor(declared: DeclaredPolicy): 'allow' | 'non_identity' {
+export function decisionFor(declared: DeclaredPolicy): 'allow' | 'non_identity' | 'bypass' {
+  if (declared.admits === 'everyone') return 'bypass'
   return declared.admits === 'emails' ? 'allow' : 'non_identity'
 }
 
 /** The `include` list a declared policy should carry. */
 export function includesFor(declared: DeclaredPolicy): IncludeRule[] {
+  if (declared.admits === 'everyone') return [{ everyone: {} }]
   return declared.admits === 'emails'
     ? emailIncludes(declared.emails)
     : serviceTokenIncludes(declared.tokenIds)
@@ -416,7 +531,8 @@ export function policyBodyFor(declared: DeclaredPolicy): Record<string, unknown>
     include: includesFor(declared),
     exclude: [],
     require: [],
-    ...(declared.sessionDuration === undefined
+    // A bypass has no session: nobody signs in.
+    ...(declared.admits === 'everyone' || declared.sessionDuration === undefined
       ? {}
       : { session_duration: declared.sessionDuration }),
   }
@@ -424,6 +540,7 @@ export function policyBodyFor(declared: DeclaredPolicy): Record<string, unknown>
 
 /** What a declared policy admits, in words, for the apply log. */
 function admits(entry: DeclaredPolicy): string {
+  if (entry.admits === 'everyone') return 'everyone, with no sign-in (a bypass)'
   return entry.admits === 'emails' ? entry.emails.join(', ') : entry.tokenIds.join(', ')
 }
 
@@ -478,6 +595,22 @@ function planOne(declared: DeclaredPolicy, mine: AccessPolicy | undefined): Poli
       mine,
       reason: `decision is "${mine.decision}" and should be "${decision}"`,
     }
+  }
+
+  // A bypass is read by its own reader, and has no session to compare.
+  if (declared.admits === 'everyone') {
+    if (!policyEveryone(mine)) {
+      return {
+        declared,
+        action: 'update',
+        mine,
+        reason: 'it admits by something other than a lone rule for everyone',
+      }
+    }
+    if ((mine.exclude ?? []).length > 0 || (mine.require ?? []).length > 0) {
+      return { declared, action: 'update', mine, reason: 'it carries exclude or require rules' }
+    }
+    return { declared, action: 'unchanged', mine }
   }
 
   // Each kind is read by its OWN reader, and each returns null the moment the
@@ -631,6 +764,8 @@ export function appBody(config: {
   appLauncherVisible: boolean
   enableBindingCookie: boolean
   httpOnlyCookieAttribute: boolean
+  pathCookieAttribute?: boolean
+  sameSiteCookieAttribute?: 'strict' | 'lax' | 'none'
 }): Record<string, unknown> {
   return {
     name: config.name,
@@ -640,6 +775,12 @@ export function appBody(config: {
     app_launcher_visible: config.appLauncherVisible,
     enable_binding_cookie: config.enableBindingCookie,
     http_only_cookie_attribute: config.httpOnlyCookieAttribute,
+    path_cookie_attribute: config.pathCookieAttribute ?? false,
+    // Only when declared: an application that says nothing is not written to
+    // and not compared (see `sameSiteCookieAttribute`).
+    ...(config.sameSiteCookieAttribute !== undefined
+      ? { same_site_cookie_attribute: config.sameSiteCookieAttribute }
+      : {}),
   }
 }
 
@@ -678,6 +819,13 @@ export function appDiffers(
     // apply a change.
     if (key === 'domain') {
       return normalizeDomain(String(want)) !== normalizeDomain(String(have ?? ''))
+    }
+    // Two fields Cloudflare omits while they hold its default. Reading that
+    // absence as different from the default would make the first apply of
+    // every application that never set them report a change it does not make.
+    if (key === 'path_cookie_attribute') return Boolean(want) !== Boolean(have)
+    if (key === 'same_site_cookie_attribute') {
+      return String(want).toLowerCase() !== String(have ?? 'none').toLowerCase()
     }
     return JSON.stringify(want) !== JSON.stringify(have)
   })
@@ -727,6 +875,51 @@ export function findApp<T extends { id: string; name: string; domain: string }>(
   if (byDomain) return { app: byDomain, by: 'domain' }
   const byName = apps.find((app) => app.name === want.name)
   return byName ? { app: byName, by: 'name' } : undefined
+}
+
+/** An Access application's audience tag: 64 lowercase hex characters. */
+const AUDIENCE_TAG = /^[0-9a-f]{64}$/
+
+/**
+ * Refuse an audience tag that is present and malformed. Pure; exported for
+ * tests.
+ *
+ * WHY HERE AND NOT ONLY IN THE CONSUMER. A Worker that verifies Access
+ * assertions is deployed with this instance's `aud` as a var, and the deploy
+ * only checks that the output is a non-empty string. A malformed one would be
+ * deployed as the audience every assertion is compared against, so every
+ * request, real ones included, would be refused while the apply reports
+ * success.
+ *
+ * EMPTY IS NOT REFUSED, because the `aud` output is documented as empty when
+ * Cloudflare did not return one, and an instance whose audience nothing reads
+ * (a machine door verified by its token alone) must keep applying. The apply
+ * says what an empty one means instead, and an importer that does read it is
+ * refused at its own apply by the engine's empty-output rule, before it
+ * deploys.
+ */
+export function assertAudience(aud: string | undefined, domain: string): void {
+  if (aud === undefined || aud === '' || AUDIENCE_TAG.test(aud)) return
+  throw new Error(
+    `refusing to continue: the Access application on ${domain} came back with an audience ` +
+      `tag that is not 64 hex characters ("${aud.slice(0, 12)}${aud.length > 12 ? '...' : ''}"). ` +
+      `A Worker verifying its assertions against it would refuse everyone.`,
+  )
+}
+
+/**
+ * The API credential every call uses: an imported instance's output, or a key
+ * of this environment's secrets.yaml. Through the engine's own rules
+ * (`ctx.output` / `ctx.secret`), so a missing import, output or key fails by
+ * name before anything is called.
+ */
+export function resolveAccessToken(
+  apiToken: { from: string; output: string } | { secret: string },
+  ctx: ApplyContext,
+): string {
+  return 'secret' in apiToken
+    ? ctx.secret(apiToken.secret, { field: 'apiToken' })
+    : ctx.output(apiToken, 'apiToken')
 }
 
 // ── Apply ─────────────────────────────────────────────────────────────────
@@ -779,7 +972,9 @@ export const cloudflareAccessModule = defineModule({
     appId: z.string(),
     /**
      * The application's audience tag, for a Worker that verifies assertions.
-     * Empty when Cloudflare did not return one.
+     * Empty when Cloudflare did not return one; never malformed, because a
+     * present tag that is not 64 hex characters fails the apply
+     * (`assertAudience`).
      */
     aud: z.string(),
     /** Passed on so a Worker derives its issuer and JWKS URL from one value. */
@@ -814,7 +1009,7 @@ export const cloudflareAccessModule = defineModule({
     changed: z.boolean(),
   }),
   async apply(config, ctx) {
-    const token = ctx.output(config.apiToken, 'apiToken')
+    const token = resolveAccessToken(config.apiToken, ctx)
     const account = `/accounts/${config.accountId}`
     const domain = normalizeDomain(config.domain)
 
@@ -1034,6 +1229,17 @@ export const cloudflareAccessModule = defineModule({
       console.log(`  Created Access application "${config.name}" on ${domain} (${app.id})`)
     }
 
+    // 3b. The audience, before anything is minted or any policy written: a
+    //     malformed one stops here, and an absent one is said out loud.
+    assertAudience(app.aud, domain)
+    if (!app.aud) {
+      console.log(
+        `  ⚠️ The Access application on ${domain} came back with no audience tag. The aud ` +
+          `output is empty, and an instance that reads it (a Worker verifying assertions) ` +
+          `will be refused at its apply.`,
+      )
+    }
+
     // 4. The service token this module owns, if one is declared.
     //
     //    AFTER the application, deliberately. The measured failure that made
@@ -1083,28 +1289,32 @@ export const cloudflareAccessModule = defineModule({
     //    and each is compared against its OWN idea of a match, so a Service Auth
     //    policy existing cannot make an `everyone` rule beside the addresses
     //    look acceptable.
-    const declared: DeclaredPolicy[] = [
-      ...(config.emails.length > 0
-        ? [
-            {
-              name: config.policyName,
-              admits: 'emails' as const,
-              emails: config.emails,
-              sessionDuration: config.sessionDuration,
-            },
-          ]
-        : []),
-      ...(serviceTokenIds.length > 0
-        ? [
-            {
-              name: serviceTokenPolicyNameFor(config),
-              admits: 'service-tokens' as const,
-              tokenIds: serviceTokenIds,
-              sessionDuration: config.sessionDuration,
-            },
-          ]
-        : []),
-    ]
+    //    A bypass declares its one policy and nothing else; the schema has
+    //    already refused one that names people or tokens.
+    const declared: DeclaredPolicy[] = config.bypass
+      ? [{ name: config.policyName, admits: 'everyone' as const }]
+      : [
+          ...(config.emails.length > 0
+            ? [
+                {
+                  name: config.policyName,
+                  admits: 'emails' as const,
+                  emails: config.emails,
+                  sessionDuration: config.sessionDuration,
+                },
+              ]
+            : []),
+          ...(serviceTokenIds.length > 0
+            ? [
+                {
+                  name: serviceTokenPolicyNameFor(config),
+                  admits: 'service-tokens' as const,
+                  tokenIds: serviceTokenIds,
+                  sessionDuration: config.sessionDuration,
+                },
+              ]
+            : []),
+        ]
 
     const actual = await cf<AccessPolicy[]>(
       token,
@@ -1185,7 +1395,14 @@ export const cloudflareAccessModule = defineModule({
 
     // 7. What a verifying consumer needs, printed as well as returned: an apply
     //    nobody can read is an apply nobody can check.
-    console.log(`  Access is now the way in to ${domain}:`)
+    if (config.bypass) {
+      console.log(
+        `  ‼️ BYPASS: ${domain} asks for NO sign-in. Anyone on the internet reaches it, and ` +
+          `what answers there must authenticate every request itself.`,
+      )
+    } else {
+      console.log(`  Access is now the way in to ${domain}:`)
+    }
     if (config.teamDomain !== undefined) console.log(`      team domain  ${config.teamDomain}`)
     if (app.aud) console.log(`      audience     ${app.aud}`)
     if (config.emails.length > 0) {

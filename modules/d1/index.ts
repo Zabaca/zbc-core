@@ -1,3 +1,7 @@
+import { spawnSync } from 'node:child_process'
+import * as fs from 'node:fs'
+import * as os from 'node:os'
+import * as path from 'node:path'
 import { z } from 'zod'
 import { defineModule } from '../../src/define-module'
 import type { ApplyContext } from '../../src/types'
@@ -16,6 +20,11 @@ import { CfError, type CfOptions, cf, cfRaw } from '../cloudflare-api'
  * wires the database in as `{ type: 'd1_databases', binding: 'DB', field:
  * 'database_id', from: '<this instance>', output: 'databaseId' }` and the
  * placeholder id in the checked-in wrangler config is never read.
+ *
+ * Schema comes two ways, and both run here, before any importing Worker
+ * deploys: `migrationsDir`, a versioned history in wrangler's own format and
+ * ledger (`d1_migrations`), applied by `wrangler d1 migrations apply`; then
+ * `statements` and `additiveColumns`, end-state DDL replayed every apply.
  *
  * Token scope: CLOUDFLARE_API_TOKEN needs Account → D1: Edit. Or set
  * `apiToken: { from, output }` to use an imported instance's output instead
@@ -123,6 +132,77 @@ function isDuplicateColumn(err: unknown): boolean {
 }
 
 /**
+ * Apply a folder of migrations with wrangler's own migrator, against the
+ * database by id.
+ *
+ * Wrangler finds a database's migrations folder in a wrangler config, so it is
+ * handed a throwaway one in a temporary directory naming only this database,
+ * its id and the folder. The id is given so wrangler uses it verbatim rather
+ * than looking the name up. The credential and account reach it through the
+ * environment, as they reach the `cloudflare` module's wrangler calls, and
+ * wrangler is the project's own (`node_modules/.bin/wrangler`) when there is
+ * one, else `bunx wrangler` on node: never `--bun`, which the `cloudflare`
+ * module's header explains.
+ */
+function applyMigrations(opts: {
+  projectRoot: string
+  migrationsDir: string
+  accountId: string
+  apiToken: string
+  databaseName: string
+  databaseId: string
+}): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zbc-d1-'))
+  const configPath = path.join(dir, 'wrangler.json')
+  try {
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({
+        name: 'zbc-d1-migrations',
+        d1_databases: [
+          {
+            binding: 'DB',
+            database_name: opts.databaseName,
+            database_id: opts.databaseId,
+            migrations_dir: path.resolve(opts.projectRoot, opts.migrationsDir),
+          },
+        ],
+      }),
+    )
+    const local = path.join(opts.projectRoot, 'node_modules', '.bin', 'wrangler')
+    const [cmd, pre] = fs.existsSync(local) ? [local, []] : ['bunx', ['wrangler']]
+    const args = [
+      ...pre,
+      'd1',
+      'migrations',
+      'apply',
+      opts.databaseName,
+      '--remote',
+      '--config',
+      configPath,
+    ]
+    const res = spawnSync(cmd, args, {
+      cwd: opts.projectRoot,
+      env: {
+        ...process.env,
+        CLOUDFLARE_API_TOKEN: opts.apiToken,
+        CLOUDFLARE_ACCOUNT_ID: opts.accountId,
+      },
+      maxBuffer: 64 * 1024 * 1024,
+    })
+    const said = `${res.stdout?.toString() ?? ''}\n${res.stderr?.toString() ?? ''}`
+    if (res.status !== 0 || res.error) {
+      throw new Error(
+        `wrangler d1 migrations apply ${opts.databaseName} failed (exit ${res.status}):\n${said.trim() || res.error?.message}`,
+      )
+    }
+    return said
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+/**
  * The credential every call below uses: an imported instance's output when
  * `apiToken` is set, else CLOUDFLARE_API_TOKEN from secrets.yaml. One helper
  * so apply, destroy and the readiness probe can never disagree on it.
@@ -159,12 +239,32 @@ export const d1Module = defineModule({
     /**
      * End-state DDL, replayed in order on EVERY apply — so every statement has
      * to be idempotent on its own (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX
-     * IF NOT EXISTS`). This is not a migration runner and keeps no ledger: it
-     * converges a schema the same way the rest of a module converges a
-     * resource. A versioned migrations directory needs somewhere to run after
-     * the deploy, which the engine does not have yet.
+     * IF NOT EXISTS`). This keeps no ledger: it converges a schema the same
+     * way the rest of a module converges a resource. A history that holds
+     * run-once steps (a backfill, a dropped table) belongs in `migrationsDir`.
      */
     statements: z.array(z.string()).default([]),
+    /**
+     * A folder of versioned migrations (`0001_init.sql`, …), relative to the
+     * project root, applied with wrangler's own migrator and recorded in its
+     * `d1_migrations` ledger: `wrangler d1 migrations apply <name> --remote`.
+     *
+     * Wrangler's format and ledger, not a second migrator: a database that
+     * was migrated by hand or by a deploy script already holds that ledger,
+     * and a runner keeping its own would replay the whole history over it.
+     *
+     * Run on THIS instance's apply, after the database resolves and before
+     * `statements`, so a Worker that imports this instance deploys only after
+     * the schema it reads is there. A migration that fails fails the apply,
+     * and the Worker behind it is not deployed. Wrangler is handed a throwaway
+     * config naming the database by the id just resolved, so the Worker's own
+     * wrangler config, and whether it binds by name or by id, play no part.
+     *
+     * Needs wrangler (this module's devDependency, run from the project's
+     * `node_modules/.bin`; `bunx wrangler` when it is not installed there) and
+     * a token that may read and write D1.
+     */
+    migrationsDir: z.string().optional(),
     /**
      * Columns added to an existing table, applied after `statements`. Separate
      * from them because `ALTER TABLE … ADD COLUMN` is the one thing SQLite
@@ -182,6 +282,17 @@ export const d1Module = defineModule({
   async apply(config, ctx) {
     const apiToken = apiTokenFor(config, ctx)
     const { accountId, databaseName } = config
+
+    // Checked before anything is called: a typo'd folder must not leave a
+    // freshly created, empty database behind it.
+    if (
+      config.migrationsDir !== undefined &&
+      !fs.existsSync(path.resolve(ctx.projectRoot, config.migrationsDir))
+    ) {
+      throw new Error(
+        `migrationsDir "${config.migrationsDir}" does not exist under the project root (${ctx.projectRoot})`,
+      )
+    }
 
     const existing = (await listDatabases(apiToken, accountId)).find((d) => d.name === databaseName)
 
@@ -209,6 +320,24 @@ export const d1Module = defineModule({
       console.log(
         `  Created database "${databaseName}" (${databaseId})${config.primaryLocationHint ? ` [${config.primaryLocationHint}]` : ''}`,
       )
+    }
+
+    if (config.migrationsDir !== undefined) {
+      const said = applyMigrations({
+        projectRoot: ctx.projectRoot,
+        migrationsDir: config.migrationsDir,
+        accountId,
+        apiToken,
+        databaseName,
+        databaseId,
+      })
+      // Wrangler's own lines about what it applied, not the whole table it draws.
+      const summary = said
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => /No migrations to apply|✅|Migrations to be applied|\.sql/.test(line))
+        .join('; ')
+      console.log(`  Migrated from ${config.migrationsDir}: ${summary || 'done'}`)
     }
 
     for (const statement of config.statements) {

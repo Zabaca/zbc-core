@@ -1,0 +1,13 @@
+{
+  "name": "queue",
+  "modules": ["cloudflare-api"],
+  "description": "Cloudflare Queue and the Email Sending event subscriptions that fill it, provisioned via the REST API. The Worker that consumes it names the queue in its wrangler config (queues.consumers).",
+  "files": [{ "path": "index.ts" }],
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "secrets": ["CLOUDFLARE_API_TOKEN"],
+  "signupUrl": "https://dash.cloudflare.com/sign-up",
+  "tokenUrl": "https://dash.cloudflare.com/profile/api-tokens",
+  "instructions": "Reads the Cloudflare API through `../cloudflare-api`; CLOUDFLARE_API_TOKEN needs the Account → Queues: Edit scope.\n\nInstance example:\n\n  // packages/infra/environments/production/delivery.ts\n  import { queueModule } from '../../modules/queue'\n  export default queueModule.instance({\n    name: 'delivery',\n    config: {\n      accountId: '<account id>',\n      queueName: 'myproject-delivery',\n      subscriptions: [{ name: 'myproject-sending', zoneId: '<zone id>', domain: 'example.com', events: ['message.delivered', 'message.bounced'] }],\n    },\n  })\n\nThe consuming Worker declares the queue by name in its own wrangler config (`queues.consumers: [{ queue: 'myproject-delivery' }]`) and imports this instance, so the queue exists before wrangler attaches the consumer. `destroy` removes the subscriptions this instance names and leaves the queue."
+}

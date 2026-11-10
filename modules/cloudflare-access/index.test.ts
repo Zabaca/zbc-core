@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import {
   type AccessPolicy,
   appBody,
+  assertAudience,
   cloudflareAccessModule,
   type DeclaredPolicy,
   emailIncludes,
@@ -11,6 +12,7 @@ import {
   planPolicies,
   policyBodyFor,
   policyEmails,
+  policyEveryone,
   policyServiceTokens,
   serviceTokenIncludes,
   serviceTokenPolicyNameFor,
@@ -517,6 +519,9 @@ describe('the bodies that get written', () => {
       app_launcher_visible: false,
       enable_binding_cookie: false,
       http_only_cookie_attribute: true,
+      // Cloudflare's own default, written so a full-replace PUT and the
+      // comparison agree on it.
+      path_cookie_attribute: false,
     })
   })
 })
@@ -1384,6 +1389,7 @@ describe('what the apply reports as changed about the application', () => {
     app_launcher_visible: true,
     enable_binding_cookie: false,
     http_only_cookie_attribute: true,
+    path_cookie_attribute: false,
   }
 
   test('a body identical to the live application differs in nothing', () => {
@@ -1404,6 +1410,7 @@ describe('what the apply reports as changed about the application', () => {
       ['app_launcher_visible', false],
       ['enable_binding_cookie', true],
       ['http_only_cookie_attribute', false],
+      ['path_cookie_attribute', true],
     ] as Array<[string, unknown]>) {
       expect(appDiffers({ ...live, [field]: value }, live), field).toEqual([field])
     }
@@ -1420,6 +1427,7 @@ describe('what the apply reports as changed about the application', () => {
       appLauncherVisible: true,
       enableBindingCookie: false,
       httpOnlyCookieAttribute: true,
+      pathCookieAttribute: false,
     })
     expect(Object.keys(desired).toSorted()).toEqual(Object.keys(live).toSorted())
   })
@@ -1527,5 +1535,319 @@ describe('the measured 403, the whole way through apply', () => {
     }
     expect(error!.message).toContain('Zero Trust organisation')
     expect(error!.message).toContain('no org')
+  })
+})
+
+// ── The deploy credential from secrets.yaml ─────────────────────────────────
+
+describe('apiToken: { secret } reads the environment deploy credential', () => {
+  const secretCtx = {
+    secrets: { CLOUDFLARE_API_TOKEN: 'deploy-token' },
+    imports: {},
+    projectRoot: '/tmp',
+  }
+
+  test('the named secrets.yaml key is the bearer of every call', async () => {
+    const world = emptyWorld()
+    let bearer: string | null = null
+    installFetch(world)
+    const stub = globalThis.fetch
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      bearer = new Headers(init?.headers).get('Authorization')
+      return stub(input, init)
+    }) as typeof fetch
+
+    await apply(
+      { apiToken: { secret: 'CLOUDFLARE_API_TOKEN' }, emails: ['tessa@northfield.example'] },
+      secretCtx,
+    )
+    expect(bearer).toBe('Bearer deploy-token')
+    expect(world.apps).toHaveLength(1)
+  })
+
+  test('a key the secrets file does not hold fails by name before anything is called', async () => {
+    const world = emptyWorld()
+    installFetch(world)
+    const error = await apply({ apiToken: { secret: 'NOT_THERE' } }, secretCtx).then(
+      () => undefined,
+      (e: Error) => e,
+    )
+    expect(error?.message).toContain('NOT_THERE')
+    expect(error?.message).toContain('secrets.yaml')
+    expect(world.calls).toEqual([])
+  })
+
+  test('the reference form still reads an import, and a value of neither shape is refused', () => {
+    const base = {
+      accountId: ACCOUNT,
+      name: 'App',
+      domain: 'app.northfield.example',
+      emails: ['tessa@northfield.example'],
+    }
+    expect(() =>
+      cloudflareAccessModule.configSchema.parse({
+        ...base,
+        apiToken: { from: 'tok', output: 'tokenValue' },
+      }),
+    ).not.toThrow()
+    expect(() =>
+      cloudflareAccessModule.configSchema.parse({ ...base, apiToken: 'CLOUDFLARE_API_TOKEN' }),
+    ).toThrow()
+  })
+})
+
+// ── Cookie attributes for an application nested under another ──────────────
+
+describe('pathCookieAttribute and sameSiteCookieAttribute', () => {
+  const live = {
+    name: 'app',
+    domain: 'app.northfield.example',
+    type: 'self_hosted',
+    session_duration: '24h',
+    app_launcher_visible: true,
+    enable_binding_cookie: false,
+    http_only_cookie_attribute: true,
+  }
+  const body = (over: Record<string, unknown> = {}) =>
+    appBody({
+      name: 'app',
+      domain: 'app.northfield.example',
+      sessionDuration: '24h',
+      appLauncherVisible: true,
+      enableBindingCookie: false,
+      httpOnlyCookieAttribute: true,
+      ...over,
+    })
+
+  test('a path cookie off, against an application that never reported the flag, is not a change', () => {
+    // Cloudflare omits a flag that was never set, and an unset flag is off.
+    // Reading the absence as different would make the first apply of every
+    // existing application report a change it does not make.
+    expect(appDiffers(body(), live)).toEqual([])
+  })
+
+  test('turning the path cookie on is written and reported', () => {
+    const wanted = body({ pathCookieAttribute: true })
+    expect(wanted.path_cookie_attribute).toBe(true)
+    expect(appDiffers(wanted, live)).toEqual(['path_cookie_attribute'])
+    expect(appDiffers(wanted, { ...live, path_cookie_attribute: true })).toEqual([])
+  })
+
+  test('SameSite is neither written nor compared unless declared', () => {
+    expect('same_site_cookie_attribute' in body()).toBe(false)
+    expect(appDiffers(body(), { ...live, same_site_cookie_attribute: 'strict' })).toEqual([])
+  })
+
+  test('a declared SameSite is written, and an absent live value is Cloudflare’s `none`', () => {
+    const lax = body({ sameSiteCookieAttribute: 'lax' })
+    expect(lax.same_site_cookie_attribute).toBe('lax')
+    expect(appDiffers(lax, live)).toEqual(['same_site_cookie_attribute'])
+    expect(appDiffers(lax, { ...live, same_site_cookie_attribute: 'Lax' })).toEqual([])
+    expect(appDiffers(body({ sameSiteCookieAttribute: 'none' }), live)).toEqual([])
+  })
+
+  test('the schema defaults the path cookie off and refuses a SameSite Cloudflare has not got', () => {
+    const base = {
+      accountId: ACCOUNT,
+      apiToken: { from: 'tok', output: 'tokenValue' },
+      name: 'App',
+      domain: 'app.northfield.example',
+      emails: ['tessa@northfield.example'],
+    }
+    const parsed = cloudflareAccessModule.configSchema.parse(base)
+    expect(parsed.pathCookieAttribute).toBe(false)
+    expect(parsed.sameSiteCookieAttribute).toBeUndefined()
+    expect(() =>
+      cloudflareAccessModule.configSchema.parse({ ...base, sameSiteCookieAttribute: 'loose' }),
+    ).toThrow()
+  })
+
+  test('a nested application applies both, and its second apply changes nothing', async () => {
+    const world = emptyWorld()
+    installFetch(world)
+    const nested = {
+      domain: 'space.northfield.example/forms',
+      emails: ['tessa@northfield.example'],
+      pathCookieAttribute: true,
+      sameSiteCookieAttribute: 'lax',
+    }
+    await apply(nested)
+    expect(world.apps[0]).toMatchObject({
+      path_cookie_attribute: true,
+      same_site_cookie_attribute: 'lax',
+    })
+    const second = await apply(nested)
+    expect(second.changed).toBe(false)
+  })
+})
+
+// ── Bypass: a path whose Worker authenticates every request itself ──────────
+
+describe('bypass: an application that asks nobody to sign in', () => {
+  const base = {
+    accountId: ACCOUNT,
+    apiToken: { from: 'tok', output: 'tokenValue' },
+    name: 'Guest links',
+    domain: 'space.northfield.example/w/*',
+  }
+
+  test('the schema accepts a bypass with nobody named, which is otherwise "no way in"', () => {
+    expect(() => cloudflareAccessModule.configSchema.parse({ ...base, emails: [] })).toThrow(
+      /no way in/,
+    )
+    expect(cloudflareAccessModule.configSchema.parse({ ...base, bypass: true }).bypass).toBe(true)
+  })
+
+  test('a bypass that also names people, a token or a rotation is refused', () => {
+    for (const extra of [
+      { emails: ['tessa@northfield.example'] },
+      { serviceTokens: [{ from: 'tok', output: 'tokenId' }] },
+      { serviceTokenName: 'guest door' },
+    ]) {
+      expect(() =>
+        cloudflareAccessModule.configSchema.parse({ ...base, bypass: true, ...extra }),
+      ).toThrow(/bypass/)
+    }
+    expect(() =>
+      cloudflareAccessModule.configSchema.parse({ ...base, bypass: true, rotate: true }),
+    ).toThrow(/rotate/)
+  })
+
+  test('it declares one Bypass policy for everyone, with no session', () => {
+    const declared: DeclaredPolicy = { name: 'guests', admits: 'everyone' }
+    expect(policyBodyFor(declared)).toEqual({
+      name: 'guests',
+      decision: 'bypass',
+      include: [{ everyone: {} }],
+      exclude: [],
+      require: [],
+    })
+  })
+
+  test('a lone everyone rule is the only thing that reads as a bypass', () => {
+    expect(policyEveryone({ include: [{ everyone: {} }] })).toBe(true)
+    expect(policyEveryone({ include: [{ everyone: {} }, { geo: { country_code: 'US' } }] })).toBe(
+      false,
+    )
+    expect(policyEveryone({ include: [{ email: { email: 'tessa@northfield.example' } }] })).toBe(
+      false,
+    )
+    expect(policyEveryone({ include: [] })).toBe(false)
+    // And the other two readers still refuse it, so a bypass never passes for people.
+    expect(policyEmails({ include: [{ everyone: {} }] })).toBeNull()
+    expect(policyServiceTokens({ include: [{ everyone: {} }] })).toBeNull()
+  })
+
+  test('a bypass policy that grew a second rule, or a narrowing one, is rewritten', () => {
+    const declared: DeclaredPolicy[] = [{ name: 'guests', admits: 'everyone' }]
+    const live = (over: Partial<AccessPolicy>) =>
+      policy({ name: 'guests', decision: 'bypass', include: [{ everyone: {} }], ...over })
+    expect(planPolicies({ declared, actual: [live({})] }).plans[0]!.action).toBe('unchanged')
+    expect(
+      planPolicies({
+        declared,
+        actual: [live({ include: [{ everyone: {} }, { ip: { ip: '0.0.0.0/0' } }] })],
+      }).plans[0]!.action,
+    ).toBe('update')
+    expect(planPolicies({ declared, actual: [live({ decision: 'allow' })] }).plans[0]!.action).toBe(
+      'update',
+    )
+    expect(
+      planPolicies({
+        declared,
+        actual: [live({ require: [{ email: { email: 'x@northfield.example' } }] })],
+      }).plans[0]!.action,
+    ).toBe('update')
+  })
+
+  test('apply makes the application and its bypass, and the second apply changes nothing', async () => {
+    const world = emptyWorld()
+    installFetch(world)
+    const config = {
+      name: 'Guest links',
+      domain: 'space.northfield.example/w/*',
+      emails: [],
+      bypass: true,
+      policyName: 'guests pass',
+      sessionDuration: '24h',
+      appLauncherVisible: false,
+    }
+    const first = await apply(config)
+    expect(world.policies).toHaveLength(1)
+    expect(world.policies[0]).toMatchObject({
+      name: 'guests pass',
+      decision: 'bypass',
+      include: [{ everyone: {} }],
+    })
+    expect(world.policies[0]!.session_duration).toBeUndefined()
+    expect(first.emails).toEqual([])
+    expect(first.policyId).toBe('')
+    expect(first.aud).toBe('a'.repeat(64))
+
+    const second = await apply(config)
+    expect(second.changed).toBe(false)
+    expect(world.policies).toHaveLength(1)
+  })
+})
+
+// ── The audience a verifying Worker is deployed with ────────────────────────
+
+const liveApp = (aud: string | undefined) => ({
+  id: 'app-live',
+  ...(aud === undefined ? {} : { aud }),
+  name: 'Admin',
+  domain: 'app.example.com/admin',
+  type: 'self_hosted',
+})
+
+describe('the audience tag', () => {
+  test('64 lowercase hex characters pass', () => {
+    expect(() =>
+      assertAudience('0123456789abcdef'.repeat(4), 'app.northfield.example'),
+    ).not.toThrow()
+  })
+
+  test('a non-empty audience that is not 64 lowercase hex characters is refused, naming the host', () => {
+    for (const bad of ['abc', 'g'.repeat(64), 'A'.repeat(64), `${'a'.repeat(64)}0`]) {
+      expect(() => assertAudience(bad, 'app.northfield.example')).toThrow(
+        /app\.northfield\.example/,
+      )
+    }
+  })
+
+  test('an empty or absent audience is not refused here: the output is documented as empty', () => {
+    expect(() => assertAudience('', 'app.northfield.example')).not.toThrow()
+    expect(() => assertAudience(undefined, 'app.northfield.example')).not.toThrow()
+  })
+
+  test('apply refuses a malformed audience before minting a token or writing a policy', async () => {
+    const world = emptyWorld({ apps: [liveApp('not-an-audience') as World['apps'][number]] })
+    installFetch(world)
+    const error = await apply({ emails: [], serviceTokenName: 'northfield agent' }).then(
+      () => undefined,
+      (e: Error) => e,
+    )
+    expect(error?.message).toContain('app.example.com/admin')
+    expect(error?.message).toContain('64 hex')
+    expect(world.tokens).toEqual([])
+    expect(world.policies).toEqual([])
+  })
+
+  test('apply with no audience back still succeeds, emits it empty, and says what that means', async () => {
+    const world = emptyWorld({ apps: [liveApp(undefined) as World['apps'][number]] })
+    installFetch(world)
+    const lines: string[] = []
+    const realLog = console.log
+    console.log = (...args: unknown[]) => {
+      lines.push(args.join(' '))
+    }
+    let out: Awaited<ReturnType<typeof apply>>
+    try {
+      out = await apply()
+    } finally {
+      console.log = realLog
+    }
+    expect(out.aud).toBe('')
+    expect(lines.join('\n')).toMatch(/no audience tag/)
   })
 })

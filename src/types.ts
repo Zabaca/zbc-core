@@ -275,6 +275,24 @@ export interface InstanceOptions<TConfig extends z.ZodType> {
    * with three different failure policies and the fourth with none at all.
    */
   ephemeral?: boolean
+  /**
+   * Never destroy this resource: `zbc destroy <env>` leaves it standing and
+   * says so, and `zbc destroy <env> <this instance>` is refused. For a
+   * resource whose loss is not a teardown but a loss of records (a database,
+   * the bucket of their files), on a module whose `destroy` deletes.
+   *
+   * A property of the INSTANCE, like `ephemeral`, because whether a resource
+   * may be torn down is the environment's decision: the same `d1` module backs
+   * a scratch database a preview throws away and one nobody may delete.
+   *
+   * The instance carries no `destroy` at all (`_definition.destroy` is
+   * removed), so an engine that predates this key skips it too, as it skips
+   * any module without one. Refused together with `ephemeral`, which destroys
+   * on every apply. To delete a retained resource, remove `retain` in a
+   * reviewed change first, or delete it in the provider by hand. See
+   * docs/adr/0019-a-retained-instance-is-never-destroyed.md in zbc.
+   */
+  retain?: boolean
 }
 
 export interface ModuleInstance<TOutputs extends z.ZodType = z.ZodType> {
@@ -284,6 +302,12 @@ export interface ModuleInstance<TOutputs extends z.ZodType = z.ZodType> {
   imports: ModuleInstance[]
   /** See `InstanceOptions.ephemeral`. Always set — the engine reads it directly. */
   ephemeral: boolean
+  /**
+   * See `InstanceOptions.retain`. Optional, unlike `ephemeral`: an instance
+   * built by an older `define-module.ts` has none, and absent means not
+   * retained, which is what that instance always was.
+   */
+  retain?: boolean
   _outputsSchema: TOutputs
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   _definition: ModuleDefinition<any, TOutputs>
